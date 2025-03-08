@@ -3,8 +3,7 @@ import numpy as np
 import sys 
 
 
-file_path_test = "~/HYPERA/HYPERA1.0/BBC039/test.txt"
-
+file_path_test = "Users/anyadecarlo/HYPERA/BBBC039_metadata/test.txt"
 
 
 def file_to_list(file_path_test): 
@@ -15,3 +14,15 @@ def file_to_list(file_path_test):
     except FileNotFoundError:
         print("non at {file_path}")
     return None
+
+
+test_list = file_to_list(file_path_test)
+
+print(test_list)
+
+
+exists = os.path.exists(file_path_test)
+print(exists)
+
+print(file_path_test)
+
