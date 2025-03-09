@@ -1,1 +1,4 @@
 epoch,state,parameter,action,reason,old_value,new_value,reward,q_value,dice_score,val_loss
+1,insufficient_data,dropout_rate,maintain,default,0.200000,None,0.0000,0.0464,0.2991,0.6366
+2,insufficient_data,normalization_type,maintain,default,instance_norm,None,0.7996,0.0947,0.2992,0.4767
+

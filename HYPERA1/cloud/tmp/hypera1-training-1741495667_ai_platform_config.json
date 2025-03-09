@@ -1,0 +1,29 @@
+{
+  "jobId": "hypera1-training-1741495667",
+  "trainingInput": {
+    "scaleTier": "CUSTOM",
+    "masterType": "n1-standard-8",
+    "masterConfig": {
+      "acceleratorConfig": {
+        "count": "1",
+        "type": "NVIDIA_TESLA_V100"
+      }
+    },
+    "packageUris": [
+      "gs://hypera-training-hypera1/packages/hypera1_training-0.1-py3-none-any.whl"
+    ],
+    "pythonModule": "package",
+    "args": [
+      "--experiment_type",
+      "agent_factory",
+      "--epochs",
+      "100",
+      "--batch_size",
+      "16",
+      "--early_stopping",
+      "20"
+    ],
+    "region": "us-central1",
+    "jobDir": "gs://hypera-training-hypera1/jobs/hypera1-training-1741495667"
+  }
+}

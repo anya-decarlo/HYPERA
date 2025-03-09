@@ -185,6 +185,51 @@ class RegionAgent(BaseSegmentationAgent):
         # Extract features from observation
         features = self._extract_features(observation)
         
+        # Ensure the features have the correct shape for the SAC policy
+        if isinstance(features, torch.Tensor):
+            # If features is a tensor, reshape it to match the expected state_dim
+            if features.dim() == 2:
+                # If features is [batch_size, feature_dim]
+                if features.shape[1] != self.state_dim:
+                    # Resize to match state_dim
+                    if features.shape[1] > self.state_dim:
+                        # Truncate if too large
+                        features = features[:, :self.state_dim]
+                    else:
+                        # Pad with zeros if too small
+                        padding = torch.zeros(features.shape[0], self.state_dim - features.shape[1], device=features.device)
+                        features = torch.cat([features, padding], dim=1)
+            else:
+                # If not 2D, reshape to [1, state_dim]
+                features = features.view(1, -1)
+                if features.shape[1] != self.state_dim:
+                    # Resize to match state_dim
+                    if features.shape[1] > self.state_dim:
+                        # Truncate if too large
+                        features = features[:, :self.state_dim]
+                    else:
+                        # Pad with zeros if too small
+                        padding = torch.zeros(1, self.state_dim - features.shape[1], device=features.device)
+                        features = torch.cat([features, padding], dim=1)
+        elif isinstance(features, np.ndarray):
+            # If features is a numpy array, reshape it to match the expected state_dim
+            if len(features.shape) == 1:
+                # If features is [feature_dim]
+                features = features.reshape(1, -1)
+            
+            # Resize to match state_dim
+            if features.shape[1] != self.state_dim:
+                if features.shape[1] > self.state_dim:
+                    # Truncate if too large
+                    features = features[:, :self.state_dim]
+                else:
+                    # Pad with zeros if too small
+                    padding = np.zeros((features.shape[0], self.state_dim - features.shape[1]), dtype=features.dtype)
+                    features = np.concatenate([features, padding], axis=1)
+            
+            # Convert to tensor if needed
+            features = torch.FloatTensor(features).to(self.device)
+        
         # Return features as state representation
         return features
     

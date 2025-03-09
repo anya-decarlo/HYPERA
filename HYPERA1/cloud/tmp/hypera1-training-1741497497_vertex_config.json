@@ -1,0 +1,30 @@
+{
+  "display_name": "hypera1-training-1741497497",
+  "job_spec": {
+    "worker_pool_specs": [
+      {
+        "machine_spec": {
+          "machine_type": "n1-standard-4"
+        },
+        "replica_count": 1,
+        "python_package_spec": {
+          "executor_image_uri": "us-docker.pkg.dev/vertex-ai/training/pytorch-cpu.1-13:latest",
+          "package_uris": [
+            "gs://hypera-training-hypera1/packages/hypera1_training-0.1-py3-none-any.whl"
+          ],
+          "python_module": "package",
+          "args": [
+            "--experiment_type",
+            "agent_factory",
+            "--epochs",
+            "100",
+            "--batch_size",
+            "16",
+            "--early_stopping",
+            "20"
+          ]
+        }
+      }
+    ]
+  }
+}

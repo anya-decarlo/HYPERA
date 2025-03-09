@@ -10,7 +10,6 @@
     "early_stopping": 50,
     "learning_rate": 0.01,
     "batch_size": 4,
-    "num_samples": 200,
     "val_ratio": 0.2,
     "agent_learning_rate": 0.3,
     "agent_exploration_rate": 0.5,

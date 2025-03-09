@@ -388,7 +388,7 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         
         Returns:
             State representation as numpy array
-
+        """
         return self.get_state_representation()
     
     def get_current_params(self) -> Dict[str, float]:
@@ -396,6 +396,6 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         Get the current loss function parameters.
         
         Returns:
-            Current loss function parameters
+            Current loss function parameters.
         """
         return self.current_params.copy()
