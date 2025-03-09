@@ -364,11 +364,29 @@ class SegmentationAgentCoordinator:
             # Get state representation from the agent
             state = agent.get_state_representation(observation)
             
+            # Ensure state is a tensor with the correct shape for the SAC policy
+            if isinstance(state, np.ndarray):
+                if len(state.shape) == 1:
+                    # If state is [state_dim], reshape to [1, state_dim]
+                    state = state.reshape(1, -1)
+                # Convert to tensor
+                state = torch.FloatTensor(state).to(self.device)
+            elif isinstance(state, torch.Tensor):
+                if state.dim() == 1:
+                    # If state is [state_dim], reshape to [1, state_dim]
+                    state = state.unsqueeze(0)
+            
             # Use the agent's policy to select an action
             action = agent.sac.select_action(state)
             
             # Apply the action to get refined segmentation
-            agent_refined = agent.apply_action(action)
+            # Handle different agent implementations (some require features, some don't)
+            try:
+                # First try with observation parameter
+                agent_refined = agent.apply_action(action, observation)
+            except TypeError:
+                # If that fails, try without observation parameter
+                agent_refined = agent.apply_action(action)
             
             # Store the agent's refinement
             features[agent.name] = agent_refined
@@ -383,6 +401,11 @@ class SegmentationAgentCoordinator:
         total_weight = 0
         
         for agent_name, refinement in features.items():
+            # Skip None refinements
+            if refinement is None:
+                print(f"Warning: Agent {agent_name} returned None refinement. Skipping.")
+                continue
+                
             weight = self.agent_weights.get(agent_name, 1.0)
             if combined is None:
                 combined = weight * refinement
@@ -390,6 +413,11 @@ class SegmentationAgentCoordinator:
                 combined += weight * refinement
             total_weight += weight
         
+        # If all refinements were None, return the initial predictions
+        if combined is None or total_weight == 0:
+            print("Warning: All agents returned None refinements. Using initial predictions.")
+            return initial_preds
+            
         if total_weight > 0:
             combined /= total_weight
         

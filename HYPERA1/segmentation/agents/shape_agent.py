@@ -147,6 +147,12 @@ class ShapeAgent(BaseSegmentationAgent):
         self.max_strength = 0.9
         self.strength_step = 0.1
         
+        # Store the last prediction shape for reference
+        self.last_prediction_shape = None
+        
+        # Default shape prior (can be "circular", "elongated", or "irregular")
+        self.current_shape_prior = "circular"
+        
         # Shape priors for different cell types
         self.shape_priors = {
             "circular": {
@@ -219,7 +225,7 @@ class ShapeAgent(BaseSegmentationAgent):
             "current_prediction": current_prediction
         }
     
-    def get_state_representation(self, observation: torch.Tensor) -> np.ndarray:
+    def get_state_representation(self, observation: torch.Tensor) -> torch.Tensor:
         """
         Extract a state representation from the observation.
         
@@ -227,19 +233,19 @@ class ShapeAgent(BaseSegmentationAgent):
             observation: The current observation
             
         Returns:
-            State representation as a numpy array
+            State representation as a tensor
         """
         # Extract features from observation
         features = self._extract_features(observation)
         
         if not features:
             # Return zero state if features extraction failed
-            return np.zeros(self.state_dim, dtype=np.float32)
+            return torch.zeros(1, self.state_dim, device=self.device)
         
         # Get shape features
         shape_features = features.get("shape_features", None)
         if shape_features is None:
-            return np.zeros(self.state_dim, dtype=np.float32)
+            return torch.zeros(1, self.state_dim, device=self.device)
         
         # Flatten shape features
         shape_features_flat = shape_features.view(-1).detach().cpu().numpy()
@@ -249,41 +255,75 @@ class ShapeAgent(BaseSegmentationAgent):
         
         # Create state representation
         # Use a subset of features to match state_dim
-        state_representation = np.zeros(self.state_dim, dtype=np.float32)
+        state_representation = np.zeros((1, self.state_dim), dtype=np.float32)
         
         # Fill state representation with shape features and metrics
         feature_count = min(self.state_dim - 3, len(shape_features_flat))
-        state_representation[:feature_count] = shape_features_flat[:feature_count]
+        state_representation[0, :feature_count] = shape_features_flat[:feature_count]
         
         # Add shape regularization strength
-        state_representation[self.state_dim - 3] = self.shape_regularization_strength
+        state_representation[0, self.state_dim - 3] = self.shape_regularization_strength
         
         # Add shape prior indicators (one-hot encoding)
         if self.current_shape_prior == "circular":
-            state_representation[self.state_dim - 2] = 1.0
+            state_representation[0, self.state_dim - 2] = 1.0
         elif self.current_shape_prior == "elongated":
-            state_representation[self.state_dim - 1] = 1.0
+            state_representation[0, self.state_dim - 1] = 1.0
         
-        return state_representation
+        # Convert to tensor
+        return torch.FloatTensor(state_representation).to(self.device)
     
-    def apply_action(self, action: np.ndarray, features: Dict[str, Any]) -> torch.Tensor:
+    def apply_action(self, action: np.ndarray, observation=None) -> torch.Tensor:
         """
         Apply the action to produce a segmentation decision.
         
         Args:
             action: Action from the SAC policy
-            features: Dictionary of extracted features
+            observation: Optional observation dictionary
             
         Returns:
             Segmentation decision tensor
         """
-        # Get current prediction from features
-        current_prediction = features.get("current_prediction", None)
+        # Get current prediction from observation or state manager
+        if observation is not None and 'current_segmentation' in observation:
+            current_prediction = observation['current_segmentation']
+            if isinstance(current_prediction, np.ndarray):
+                current_prediction = torch.from_numpy(current_prediction).float().to(self.device)
+        else:
+            # Get from state manager
+            current_prediction = self.state_manager.get_current_prediction()
+            
         if current_prediction is None:
-            return None
+            print("ShapeAgent: No current prediction available")
+            # Return a default prediction (all zeros) with the same shape as expected
+            # This is better than returning None
+            if hasattr(self, 'last_prediction_shape') and self.last_prediction_shape is not None:
+                return torch.zeros(self.last_prediction_shape, device=self.device)
+            else:
+                # Default shape if we don't know the expected shape
+                return torch.zeros((1, 1, 64, 64), device=self.device)
+        
+        # Store the shape for future reference
+        self.last_prediction_shape = current_prediction.shape
+        
+        # Ensure tensor is on the correct device
+        current_prediction = current_prediction.to(self.device)
+        
+        # Add batch and channel dimensions if needed
+        if current_prediction.dim() == 2:
+            current_prediction = current_prediction.unsqueeze(0).unsqueeze(0)
+        elif current_prediction.dim() == 3:
+            current_prediction = current_prediction.unsqueeze(0)
         
         # Scale action to shape regularization strength adjustment
-        action_scaled = action[0] * self.strength_step
+        if isinstance(action, np.ndarray):
+            action = torch.from_numpy(action).float().to(self.device)
+            
+        # Ensure action has the correct shape
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+            
+        action_scaled = action[0, 0].item() * self.strength_step
         
         # Update shape regularization strength
         new_strength = self.shape_regularization_strength + action_scaled
@@ -304,8 +344,23 @@ class ShapeAgent(BaseSegmentationAgent):
         Returns:
             Refined prediction tensor
         """
+        # Store original shape and dimensions
+        original_shape = prediction.shape
+        original_device = prediction.device
+        
         # Convert to numpy for morphological operations
+        # Extract the first image from batch and first channel
         pred_np = prediction.detach().cpu().numpy()
+        
+        # Handle different dimensions
+        if len(pred_np.shape) == 4:  # [B, C, H, W]
+            # Process only the first image from the batch and first channel
+            pred_np_2d = pred_np[0, 0]
+        elif len(pred_np.shape) == 3:  # [C, H, W]
+            # Process only the first channel
+            pred_np_2d = pred_np[0]
+        else:  # [H, W]
+            pred_np_2d = pred_np
         
         # Apply morphological operations based on shape prior and regularization strength
         from skimage import morphology
@@ -313,37 +368,50 @@ class ShapeAgent(BaseSegmentationAgent):
         # Determine structuring element size based on regularization strength
         struct_size = max(1, int(3 * self.shape_regularization_strength))
         
+        # Apply morphological operations to 2D image
         if self.current_shape_prior == "circular":
             # Use disk structuring element for circular shapes
             selem = morphology.disk(struct_size)
             # Apply opening to remove small protrusions
-            pred_np = morphology.opening(pred_np > 0.5, selem)
+            refined_np_2d = morphology.opening(pred_np_2d > 0.5, selem)
             # Apply closing to fill small holes
-            pred_np = morphology.closing(pred_np, selem)
+            refined_np_2d = morphology.closing(refined_np_2d, selem)
         
         elif self.current_shape_prior == "elongated":
             # Use elliptical structuring element for elongated shapes
             selem = morphology.ellipse(struct_size, 2 * struct_size)
             # Apply opening and closing
-            pred_np = morphology.opening(pred_np > 0.5, selem)
-            pred_np = morphology.closing(pred_np, selem)
+            refined_np_2d = morphology.opening(pred_np_2d > 0.5, selem)
+            refined_np_2d = morphology.closing(refined_np_2d, selem)
         
         else:  # irregular
             # Use smaller structuring element for irregular shapes
             selem = morphology.square(struct_size)
             # Apply less aggressive morphological operations
-            pred_np = morphology.opening(pred_np > 0.5, selem)
-            pred_np = morphology.closing(pred_np, selem)
+            refined_np_2d = morphology.opening(pred_np_2d > 0.5, selem)
+            refined_np_2d = morphology.closing(refined_np_2d, selem)
         
-        # Convert back to tensor
-        refined_prediction = torch.tensor(pred_np.astype(np.float32), device=self.device)
+        # Convert back to tensor and restore original dimensions
+        refined_tensor = torch.tensor(refined_np_2d.astype(np.float32), device=original_device)
+        
+        # Reshape to match original dimensions
+        if len(original_shape) == 4:  # [B, C, H, W]
+            refined_tensor = refined_tensor.unsqueeze(0).unsqueeze(0)
+            # Repeat for all batch items if needed
+            if original_shape[0] > 1:
+                refined_tensor = refined_tensor.repeat(original_shape[0], 1, 1, 1)
+            # Repeat for all channels if needed
+            if original_shape[1] > 1:
+                refined_tensor = refined_tensor.repeat(1, original_shape[1], 1, 1)
+        elif len(original_shape) == 3:  # [C, H, W]
+            refined_tensor = refined_tensor.unsqueeze(0)
+            # Repeat for all channels if needed
+            if original_shape[0] > 1:
+                refined_tensor = refined_tensor.repeat(original_shape[0], 1, 1)
         
         # Blend with original prediction based on regularization strength
-        if len(prediction.shape) == 4:
-            refined_prediction = refined_prediction.view(prediction.shape)
-        
         blended_prediction = (1 - self.shape_regularization_strength) * prediction + \
-                             self.shape_regularization_strength * refined_prediction
+                            self.shape_regularization_strength * refined_tensor
         
         return blended_prediction
     

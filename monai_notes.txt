@@ -1,0 +1,11 @@
+monai.transforms 
+
+
+
+flatten()
+
+
+A Compose([transformA, transformB, transformC], map_items=True)(data_dict) 
+
+monai.transforms.EnsureChannelFirstd
+

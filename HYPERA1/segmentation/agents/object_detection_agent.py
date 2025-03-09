@@ -135,19 +135,24 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
     
     def _extract_features(self, observation):
         """
-        Extract features from the observation.
+        Extract features from observation.
         
         Args:
             observation: Dictionary containing observation data
             
         Returns:
-            Extracted features
+            Dictionary of extracted features
         """
-        # Get current segmentation and ground truth
-        current_seg = observation.get("current_segmentation", None)
-        ground_truth = observation.get("ground_truth", None)
+        # Extract current segmentation and ground truth from observation
+        if isinstance(observation, dict):
+            current_seg = observation.get('current_segmentation', None)
+            ground_truth = observation.get('ground_truth', None)
+        else:
+            # If observation is not a dictionary, return empty features
+            return {"features": torch.zeros(self.state_dim, device=self.device)}
         
         if current_seg is None or ground_truth is None:
+            # Return empty features if segmentation or ground truth is missing
             return {"features": torch.zeros(self.state_dim, device=self.device)}
         
         # Ensure tensors are on the correct device
@@ -171,9 +176,23 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
         with torch.no_grad():
             features = self.feature_extractor(current_seg)
         
+        # Ensure we have 2D or 3D images for regionprops
+        # Get the first batch and channel for regionprops
+        current_seg_np = current_seg[0, 0].cpu().numpy()
+        ground_truth_np = ground_truth[0, 0].cpu().numpy()
+        
         # Calculate object-level metrics
-        object_metrics = self._calculate_object_metrics(current_seg.squeeze().cpu().numpy(), 
-                                                       ground_truth.squeeze().cpu().numpy())
+        try:
+            object_metrics = self._calculate_object_metrics(current_seg_np, ground_truth_np)
+        except Exception as e:
+            # If there's an error in calculating metrics, return default metrics
+            print(f"Error calculating object metrics: {e}")
+            object_metrics = {
+                "count_accuracy": 0.0,
+                "size_accuracy": 0.0,
+                "shape_accuracy": 0.0,
+                "object_iou": 0.0
+            }
         
         # Combine features with object metrics
         combined_features = {
@@ -200,69 +219,71 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
         feature_tensor = features["features"]
         
         # Ensure the feature tensor has the correct shape
-        if feature_tensor.shape[0] != self.state_dim:
-            # Resize to match state_dim using adaptive pooling
-            feature_tensor = F.adaptive_avg_pool1d(feature_tensor.unsqueeze(0), self.state_dim).squeeze(0)
+        if feature_tensor.dim() == 1:
+            # If 1D, reshape to [1, feature_dim]
+            feature_tensor = feature_tensor.unsqueeze(0)
         
-        # Convert to numpy array for SAC
-        state = feature_tensor.cpu().numpy()
+        # Ensure the second dimension matches state_dim
+        if feature_tensor.shape[1] != self.state_dim:
+            # Resize to match state_dim
+            if feature_tensor.shape[1] > self.state_dim:
+                # Truncate if too large
+                feature_tensor = feature_tensor[:, :self.state_dim]
+            else:
+                # Pad with zeros if too small
+                padding = torch.zeros(feature_tensor.shape[0], self.state_dim - feature_tensor.shape[1], device=feature_tensor.device)
+                feature_tensor = torch.cat([feature_tensor, padding], dim=1)
         
-        return state
+        # Return as tensor for SAC
+        return feature_tensor
     
-    def apply_action(self, action):
+    def apply_action(self, action, observation=None):
         """
         Apply the selected action to modify the segmentation.
         
         Args:
             action: Action to apply
+            observation: Optional observation dictionary
             
         Returns:
             Modified segmentation
         """
-        # Get current segmentation
-        current_seg = self.state_manager.get_current_segmentation()
+        # Get current prediction from state manager or observation
+        if observation is not None and 'current_segmentation' in observation:
+            current_seg = observation['current_segmentation']
+        else:
+            # Get current prediction from state manager
+            current_seg = self.state_manager.get_current_prediction()
         
         if current_seg is None:
+            # Return None if no prediction is available
             return None
         
-        # Convert to tensor if needed
-        if isinstance(current_seg, np.ndarray):
-            current_seg = torch.from_numpy(current_seg).float().to(self.device)
+        # Ensure tensor is on the correct device
+        current_seg = current_seg.to(self.device)
         
-        # Add batch and channel dimensions if needed
-        if current_seg.dim() == 2:
-            current_seg = current_seg.unsqueeze(0).unsqueeze(0)
-        elif current_seg.dim() == 3:
-            current_seg = current_seg.unsqueeze(0)
+        # Interpret action
+        # Action is a tensor with shape [batch_size, action_dim]
+        if isinstance(action, np.ndarray):
+            action = torch.FloatTensor(action).to(self.device)
+            
+        # Ensure action has the correct shape
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+            
+        # Extract action components
+        # Each component controls a different aspect of object detection refinement
+        threshold_adjustment = action[0, 0].item()  # Adjust detection threshold
         
-        # Apply action to modify detection threshold and min object size
-        # Scale action from [-1, 1] to appropriate ranges
-        detection_threshold_delta = action[0] * 0.1  # Scale to [-0.1, 0.1]
-        self.detection_threshold = np.clip(self.detection_threshold + detection_threshold_delta, 0.1, 0.9)
+        # Apply threshold adjustment to the segmentation
+        # Map action from [-1, 1] to [0.1, 0.9] for threshold
+        threshold = 0.5 + (threshold_adjustment * 0.4)
+        threshold = max(0.1, min(0.9, threshold))  # Clamp to valid range
         
-        if action.shape[0] > 1:
-            min_size_delta = action[1] * 5  # Scale to [-5, 5]
-            self.min_object_size = max(1, self.min_object_size + int(min_size_delta))
+        # Apply threshold to get binary segmentation
+        refined_seg = (current_seg > threshold).float()
         
-        # Apply thresholding
-        thresholded = (current_seg > self.detection_threshold).float()
-        
-        # Remove small objects (on CPU for skimage compatibility)
-        labeled = label(thresholded.squeeze().cpu().numpy())
-        for region in regionprops(labeled):
-            if region.area < self.min_object_size:
-                labeled[labeled == region.label] = 0
-        
-        # Convert back to binary mask
-        filtered = (labeled > 0).astype(np.float32)
-        
-        # Convert back to tensor and return
-        filtered_tensor = torch.from_numpy(filtered).float().to(self.device)
-        
-        # Update the segmentation in the state manager
-        self.state_manager.update_segmentation(filtered_tensor.cpu().numpy())
-        
-        return filtered_tensor
+        return refined_seg
     
     def _save_agent_state(self, path):
         """

@@ -34,9 +34,6 @@ class BoundaryAgent(BaseSegmentationAgent):
         learning_rate (float): Learning rate for optimizer
         gamma (float): Discount factor for future rewards
         update_frequency (int): Frequency of agent updates
-        last_update_step (int): Last step when agent was updated
-        action_history (List): History of actions taken by agent
-        reward_history (List): History of rewards received by agent
         observation_history (List): History of observations
         verbose (bool): Whether to print verbose output
     """
@@ -113,7 +110,7 @@ class BoundaryAgent(BaseSegmentationAgent):
         """
         # Feature extractor for boundary features
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(2, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
@@ -153,6 +150,13 @@ class BoundaryAgent(BaseSegmentationAgent):
             [-1,  8, -1],
             [-1, -1, -1]
         ], dtype=torch.float32).view(1, 1, 3, 3).to(self.device)
+        
+        # Initialize observation history
+        self.observation_history = []
+        self.training = True  # Add training attribute initialization
+        
+        if self.verbose:
+            self.logger.info("Initialized boundary components")
     
     def observe(self) -> Dict[str, Any]:
         """
@@ -163,7 +167,7 @@ class BoundaryAgent(BaseSegmentationAgent):
         """
         # Get current state from state manager
         current_image = self.state_manager.get_current_image()
-        current_mask = self.state_manager.get_current_mask()
+        current_mask = self.state_manager.get_current_ground_truth()
         current_prediction = self.state_manager.get_current_prediction()
         
         if current_image is None or current_mask is None or current_prediction is None:
@@ -204,20 +208,28 @@ class BoundaryAgent(BaseSegmentationAgent):
     
     def _extract_boundary(self, mask: torch.Tensor) -> torch.Tensor:
         """
-        Extract boundary from a mask using edge detection.
+        Extract boundary from a segmentation mask.
         
         Args:
-            mask: Binary mask tensor
+            mask: Segmentation mask tensor
             
         Returns:
             Boundary tensor
         """
-        # Ensure mask is binary
-        binary_mask = (mask > 0.5).float()
+        # Handle multi-class masks by converting to binary (foreground vs background)
+        if len(mask.shape) == 5:  # Shape: [batch_size, channels, num_classes, height, width]
+            # Sum over all foreground classes (assuming class 0 is background)
+            binary_mask = (torch.sum(mask[:, :, 1:, ...], dim=2) > 0.5).float()
+        elif len(mask.shape) == 4 and mask.shape[1] > 1:  # Shape: [batch_size, num_classes, height, width]
+            # Sum over all foreground classes (assuming class 0 is background)
+            binary_mask = (torch.sum(mask[:, 1:, ...], dim=1) > 0.5).float()
+        else:
+            # Already binary
+            binary_mask = (mask > 0.5).float()
         
         # Apply edge detection kernel
         boundary = F.conv2d(
-            binary_mask.unsqueeze(1),
+            binary_mask.unsqueeze(1) if binary_mask.dim() == 3 else binary_mask,
             self.edge_kernel,
             padding=1
         )
@@ -426,13 +438,9 @@ class BoundaryAgent(BaseSegmentationAgent):
         return {
             "name": self.name,
             "boundary_sensitivity": self.boundary_sensitivity,
-            "learning_rate": self.learning_rate,
+            "lr": self.lr,
             "gamma": self.gamma,
             "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history_length": len(self.action_history),
-            "reward_history_length": len(self.reward_history),
-            "observation_history_length": len(self.observation_history),
             "training": self.training
         }
     
@@ -446,11 +454,11 @@ class BoundaryAgent(BaseSegmentationAgent):
         if "boundary_sensitivity" in state:
             self.boundary_sensitivity = state["boundary_sensitivity"]
         
-        if "learning_rate" in state:
-            self.learning_rate = state["learning_rate"]
+        if "lr" in state:
+            self.lr = state["lr"]
             # Update optimizer with new learning rate
             for param_group in self.optimizer.param_groups:
-                param_group["lr"] = self.learning_rate
+                param_group["lr"] = self.lr
         
         if "gamma" in state:
             self.gamma = state["gamma"]
@@ -474,12 +482,9 @@ class BoundaryAgent(BaseSegmentationAgent):
             "policy_network": self.policy_network.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "boundary_sensitivity": self.boundary_sensitivity,
-            "learning_rate": self.learning_rate,
+            "lr": self.lr,
             "gamma": self.gamma,
             "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history": self.action_history,
-            "reward_history": self.reward_history,
             "training": self.training
         }
         
@@ -506,12 +511,9 @@ class BoundaryAgent(BaseSegmentationAgent):
         
         # Load agent parameters
         self.boundary_sensitivity = state_dict["boundary_sensitivity"]
-        self.learning_rate = state_dict["learning_rate"]
+        self.lr = state_dict["lr"]
         self.gamma = state_dict["gamma"]
         self.update_frequency = state_dict["update_frequency"]
-        self.last_update_step = state_dict["last_update_step"]
-        self.action_history = state_dict["action_history"]
-        self.reward_history = state_dict["reward_history"]
         self.training = state_dict["training"]
         
         if self.verbose:
@@ -536,7 +538,7 @@ class BoundaryAgent(BaseSegmentationAgent):
         """
         # Get current state from state manager
         current_image = self.state_manager.get_current_image()
-        current_mask = self.state_manager.get_current_mask()
+        current_mask = self.state_manager.get_current_ground_truth()
         current_prediction = self.state_manager.get_current_prediction()
         
         if current_image is None or current_mask is None or current_prediction is None:
@@ -568,27 +570,55 @@ class BoundaryAgent(BaseSegmentationAgent):
         
         return features
     
-    def get_state_representation(self, observation: torch.Tensor) -> np.ndarray:
+    def get_state_representation(self, features):
         """
-        Extract a state representation from the observation.
+        Get state representation from features.
         
         Args:
-            observation: The current observation
+            features: Dictionary of features
             
         Returns:
-            State representation as a numpy array
+            State representation
         """
-        # Get features
-        features = self._extract_features(observation)
+        
+        # Check if input is an observation dictionary
+        if isinstance(features, dict) and 'current_segmentation' in features:
+            # Extract features from observation
+            features = self._extract_features(features)
         
         if not features:
             # Return zero state if features are empty
-            return np.zeros(self.state_dim, dtype=np.float32)
+            return torch.zeros(1, self.state_dim, device=self.device)
         
         # Extract boundary features using feature extractor
+        if "current_image" not in features or "pred_boundary" not in features:
+            # Missing required features, return zero state
+            return torch.zeros(1, self.state_dim, device=self.device)
+            
         current_image = features["current_image"]
         pred_boundary = features["pred_boundary"]
         
+        # Ensure tensors have compatible dimensions for concatenation
+        if current_image.dim() == 5:  # Shape: [batch_size, channels, num_classes, height, width]
+            # Take the first channel and class
+            current_image = current_image[:, 0, 0, :, :]
+        elif current_image.dim() == 4 and current_image.shape[1] > 1:  # Shape: [batch_size, num_classes, height, width]
+            # Take the first channel
+            current_image = current_image[:, 0, :, :]
+            
+        if pred_boundary.dim() == 5:  # Shape: [batch_size, channels, num_classes, height, width]
+            # Take the first channel and class
+            pred_boundary = pred_boundary[:, 0, 0, :, :]
+        elif pred_boundary.dim() == 4 and pred_boundary.shape[1] > 1:  # Shape: [batch_size, channels, height, width]
+            # Take the first channel
+            pred_boundary = pred_boundary[:, 0, :, :]
+            
+        # Ensure both tensors are 3D (batch_size, height, width)
+        if current_image.dim() == 4 and current_image.shape[1] == 1:
+            current_image = current_image.squeeze(1)
+        if pred_boundary.dim() == 4 and pred_boundary.shape[1] == 1:
+            pred_boundary = pred_boundary.squeeze(1)
+            
         # Combine image and predicted boundary for feature extraction
         combined_input = torch.cat([
             current_image.unsqueeze(1),
@@ -598,22 +628,25 @@ class BoundaryAgent(BaseSegmentationAgent):
         # Extract features using the feature extractor
         with torch.no_grad():
             boundary_features = self.feature_extractor(combined_input)
-            boundary_features = boundary_features.view(-1).cpu().numpy()
+            boundary_features = boundary_features.view(combined_input.size(0), -1).cpu().numpy()
         
-        # Add scalar metrics to the state
-        state = np.zeros(self.state_dim, dtype=np.float32)
+        # Create state vector with the correct dimension
+        state = np.zeros((combined_input.size(0), self.state_dim), dtype=np.float32)
         
         # Fill in the state with boundary features (truncate or pad as needed)
-        feature_size = min(len(boundary_features), self.state_dim - 2)
-        state[:feature_size] = boundary_features[:feature_size]
+        feature_size = min(boundary_features.shape[1], self.state_dim - 2)
+        state[:, :feature_size] = boundary_features[:, :feature_size]
         
         # Add scalar metrics to the state
         if "hausdorff_distance" in features:
-            state[-2] = features["hausdorff_distance"]
+            state[:, -2] = features["hausdorff_distance"]
         if "boundary_dice" in features:
-            state[-1] = features["boundary_dice"]
+            state[:, -1] = features["boundary_dice"]
+            
+        # Convert to tensor
+        state_tensor = torch.FloatTensor(state).to(self.device)
         
-        return state
+        return state_tensor
     
     def apply_action(self, action: np.ndarray, features: Dict[str, Any]) -> torch.Tensor:
         """
@@ -672,6 +705,22 @@ class BoundaryAgent(BaseSegmentationAgent):
         kernel_size = 3
         padding = kernel_size // 2
         
+        # Ensure boundary has the right shape
+        if boundary.dim() == 4 and boundary.shape[1] == 1:
+            # Shape: [batch_size, 1, height, width]
+            boundary = boundary.squeeze(1)
+        elif boundary.dim() == 2:
+            # Shape: [height, width]
+            boundary = boundary.unsqueeze(0)  # Add batch dimension
+            
+        # Ensure prediction has the right shape
+        if prediction.dim() == 2:
+            # Shape: [height, width]
+            prediction = prediction.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        elif prediction.dim() == 3:
+            # Shape: [batch_size, height, width]
+            prediction = prediction.unsqueeze(1)  # Add channel dimension
+            
         # Dilate the boundary
         dilated_boundary = F.max_pool2d(
             boundary.unsqueeze(1),
@@ -687,6 +736,13 @@ class BoundaryAgent(BaseSegmentationAgent):
         # Where the boundary is active, make the prediction more decisive
         # (closer to 0 or 1)
         boundary_mask = dilated_boundary > 0.5
+        
+        # Ensure the mask has the right shape for indexing
+        if boundary_mask.dim() == 3 and refined_prediction.dim() == 4:
+            # Expand mask to match prediction dimensions
+            boundary_mask = boundary_mask.unsqueeze(1).expand_as(refined_prediction)
+            
+        # Apply the mask
         refined_prediction[boundary_mask] = torch.where(
             refined_prediction[boundary_mask] > 0.5,
             torch.ones_like(refined_prediction[boundary_mask]),
@@ -750,5 +806,3 @@ class BoundaryAgent(BaseSegmentationAgent):
         
         # Clear any cached data
         self.observation_history = []
-        self.action_history = []
-        self.reward_history = []
