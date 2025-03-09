@@ -214,6 +214,15 @@ class BaseHyperparameterAgent(ABC):
         """
         pass
     
+    def _apply_action(self, processed_action: Any) -> None:
+        """
+        Apply the processed action to modify the hyperparameter.
+        
+        Args:
+            processed_action: The processed action to apply
+        """
+        pass
+    
     def _calculate_reward(self, metrics: Dict[str, float]) -> float:
         """
         Calculate reward based on current metrics.
@@ -295,16 +304,6 @@ class BaseHyperparameterAgent(ABC):
         
         # Return the normalized and clipped reward
         return reward_components.get("normalized_total", 0.0) * 2.0  # Amplify final reward
-    
-    @abstractmethod
-    def _apply_action(self, processed_action: Any) -> None:
-        """
-        Apply the processed action to modify the hyperparameter.
-        
-        Args:
-            processed_action: The processed action to apply
-        """
-        pass
     
     def apply_action(self, action, epoch):
         """
