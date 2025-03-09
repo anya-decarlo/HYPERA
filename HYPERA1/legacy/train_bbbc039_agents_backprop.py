@@ -496,7 +496,7 @@ def main():
         loss_function = DiceLoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
         )
     elif args.loss == "DiceCE":
         # Start with balanced weights for all classes
@@ -504,7 +504,7 @@ def main():
         loss_function = DiceCELoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
             lambda_ce=0.5,
             lambda_dice=1.0,
             weight=class_weights
