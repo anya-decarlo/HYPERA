@@ -803,7 +803,7 @@ def main():
         "lambda_ce": loss_function.lambda_ce if hasattr(loss_function, "lambda_ce") else None,
         "lambda_dice": loss_function.lambda_dice if hasattr(loss_function, "lambda_dice") else None,
         "focal_gamma": loss_function.focal_gamma if hasattr(loss_function, "focal_gamma") else None,
-        "include_background": loss_function.include_background if hasattr(loss_function, "include_background") else True,
+        "include_background": False,  # include_background is always False
         "dropout": args.dropout,
         "augmentations": args.augmentations,
         "best_metric": best_metric,

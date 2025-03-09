@@ -739,8 +739,10 @@ def main():
                 # Calculate loss
                 val_loss += loss_function(val_outputs, val_labels).item()
                 
-                # Calculate Dice score
-                dice_metric(y_pred=val_outputs, y=val_labels)
+                # Calculate Dice score - apply post-processing transforms first
+                val_outputs_processed = post_pred(val_outputs)
+                val_labels_processed = post_label(val_labels)
+                dice_metric(y_pred=val_outputs_processed, y=val_labels_processed)
         
         # Aggregate validation metrics
         val_loss /= len(val_loader)
@@ -798,7 +800,7 @@ def main():
                 lambda_dice,
                 class_weights,
                 current_threshold,
-                loss_function.include_background if hasattr(loss_function, "include_background") else True,
+                False,  # include_background is always False
                 "instance_norm"  # Default normalization type
             ])
         
