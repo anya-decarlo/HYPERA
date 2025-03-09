@@ -47,6 +47,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 from monai.config import print_config
 from monai.utils import set_determinism
 from monai.transforms import (
@@ -283,6 +284,12 @@ def main():
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
+
+    # Create TensorBoard writer with a unique directory
+    tb_log_dir = os.path.join(logs_dir, f"tensorboard_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(tb_log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    print(f"TensorBoard logs will be saved to: {tb_log_dir}")
 
     # Save hyperparameters
     save_file(vars(args), os.path.join(logs_dir, "hyperparameters.json"), cloud_results_dir + "/logs/hyperparameters.json" if using_cloud_storage else None)
@@ -562,6 +569,11 @@ def main():
     # Create a file for logging agent changes
     agent_changes_file = os.path.join(logs_dir, "agent_changes.log")
     save_file(f"Agent changes log - {timestamp}\n" + "=" * 50 + "\n\n", agent_changes_file, cloud_results_dir + "/logs/agent_changes.log" if using_cloud_storage else None)
+    
+    # Setup metrics logging
+    metrics_logs_dir = os.path.join(logs_dir, "metrics_logs")
+    os.makedirs(metrics_logs_dir, exist_ok=True)
+    metrics_logging = setup_agent_logging(metrics_logs_dir)
     
     # Import agents from HYPERA1/agents
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1058,11 +1070,23 @@ def main():
                 gcs_vis_path = os.path.join(cloud_results_dir, "visualizations", f"epoch_{epoch + 1}.png")
                 copy_to_gcs(vis_path, gcs_vis_path)
     
+    # Save final model
+    final_model_file = os.path.join(models_dir, "final_model.pth")
+    torch.save(model.state_dict(), final_model_file)
+    if using_cloud_storage:
+        copy_to_gcs(final_model_file, cloud_results_dir + "/models/final_model.pth")
+    
+    # Close TensorBoard writer
+    writer.close()
+    
+    print(f"Training completed. Results saved to {results_dir}")
+    if using_cloud_storage:
+        print(f"Results also saved to {cloud_results_dir}")
+    
     # Close all log files
     for file_handle in agent_logging['files'].values():
         file_handle.close()
     
-    print(f"Training completed. Results saved to {results_dir}")
     print(f"Agent logs saved to {agent_logs_dir}")
     
     # Copy logs to cloud storage if needed
