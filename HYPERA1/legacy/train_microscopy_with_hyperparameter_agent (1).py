@@ -40,7 +40,7 @@ from monai.transforms import (
     Orientationd,
     Spacingd,
     SelectItemsd,
-    ArgmaxD,
+    AsDiscreted,
 )
 from monai.networks.nets import UNet
 from monai.networks.layers import Norm
@@ -77,7 +77,6 @@ def main():
         help="Initial learning rate for optimizer"
     )
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--num_samples", type=int, default=200, help="Number of synthetic samples to generate")
     parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation ratio")
     
     # RL hyperparameter agent specific arguments
@@ -202,7 +201,7 @@ def main():
             *augmentations,  # Add selected augmentations
             EnsureTyped(keys=["image", "label"]),
             #SelectItemsd(keys = ["image", "label"], index = 1, channel_dim = 1)
-            ArgmaxD(keys = "label", dim = 1)
+            AsDiscreted(keys = "label", argmax = True, to_onehot = 5)
        ]
     )
 
@@ -216,8 +215,7 @@ def main():
             #Resized(keys=["image", "label"], spatial_size=spatial_size, mode=("trilinear", "nearest")),
             EnsureTyped(keys=["image", "label"]),
             #SelectItemsd(keys = ["image", "label"], index = 1, channel_dim = 1)
-            ArgmaxD(keys = "label", dim = 1)
-
+            AsDiscreted(keys = "label", argmax = True, to_onehot = 5)
         ]
     )
 
