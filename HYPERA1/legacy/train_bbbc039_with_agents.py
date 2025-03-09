@@ -459,7 +459,7 @@ def main():
         loss_function = DiceLoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
         )
     elif args.loss == "DiceCE":
         # Start with balanced weights for all classes
@@ -467,7 +467,7 @@ def main():
         loss_function = DiceCELoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
             lambda_ce=0.5,
             lambda_dice=1.0,
             weight=class_weights
@@ -506,7 +506,7 @@ def main():
         )
     
     # Define metrics for evaluation
-    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
     
     # Define post-processing transforms - we'll use a default threshold of 0.5 initially
     # The threshold will be updated by the agents during training
