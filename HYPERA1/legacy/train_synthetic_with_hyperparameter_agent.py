@@ -37,7 +37,7 @@ from monai.transforms import (
     Resized,
     NormalizeIntensityd,
     Orientationd,
-    Spacingd,
+    SelectItemsd
 )
 from monai.networks.nets import UNet
 from monai.networks.layers import Norm
@@ -210,7 +210,7 @@ def main():
     if args.loss == "Dice":
         # Start with basic parameters
         loss_function = DiceLoss(
-            to_onehot_y=True,
+            to_onehot_y=False,
             softmax=True,
             include_background=True,  # Start with including background (may not be optimal)
         )

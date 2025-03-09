@@ -1,0 +1,1 @@
+epoch,train_loss,val_loss,dice_score,lr,lambda_ce,lambda_dice,class_weights,threshold,include_background,normalization_type

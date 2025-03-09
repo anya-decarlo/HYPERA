@@ -14,8 +14,6 @@ import torch
 import torch.nn as nn
 from monai.apps import download_and_extract
 from monai.config import print_config
-from rl_hyperparameter_agent import RLHyperparameterAgent
-# from class_weights_agent import ClassWeightsAgent
 from monai.utils import set_determinism
 from monai.transforms import (
     Activations,
@@ -77,6 +75,9 @@ def main():
     parser.add_argument("--num_samples", type=int, default=200, help="Number of synthetic samples to generate")
     parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation ratio")
     
+
+    # HYPERA1 agents specialized and utils specific arguments 
+
     # RL hyperparameter agent specific arguments
     parser.add_argument("--agent_learning_rate", type=float, default=0.3, 
                         help="Learning rate for the RL agent (not the model)")
@@ -120,8 +121,6 @@ def main():
             "label": os.path.join(data_dir, item["label"]),
         })
     
-
-    
     # Split into training and validation
     val_idx = int(len(data_dicts) * 0.2)
     train_files = data_dicts[val_idx:]
@@ -131,7 +130,7 @@ def main():
     print(f"Validation samples: {len(val_files)}")
 
     # Define a fixed spatial size for all images based on patch size
-    spatial_size = [args.patch_size, args.patch_size, args.patch_size]
+    spatial_size = [args.patch_size, args.patch_size]
 
     # Define augmentations based on the selected strategy
     augmentations = []
@@ -150,8 +149,6 @@ def main():
         [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
             NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
             Resized(keys=["image", "label"], spatial_size=spatial_size, mode=("trilinear", "nearest")),
             RandSpatialCropd(keys=["image", "label"], roi_size=spatial_size, random_size=False),
@@ -164,7 +161,6 @@ def main():
         [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
             Resized(keys=["image", "label"], spatial_size=spatial_size, mode=("trilinear", "nearest")),
@@ -194,9 +190,9 @@ def main():
 
     # Create model
     model = UNet(
-        spatial_dims=3,
+        spatial_dims=2,
         in_channels=1,
-        out_channels=3,  # Background + 2 structures
+        out_channels=4,  # Background + 2 structures
         channels=(16, 32, 64, 128),  # Simpler architecture with fewer channels
         strides=(2, 2, 2),  # Fewer downsampling steps
         num_res_units=1,  # Fewer residual units
@@ -255,6 +251,12 @@ def main():
             weight_decay=args.weight_decay,
             momentum=0.9
         )
+
+
+
+    # Initiliaze HYPERA1 agent module with multiple agents 
+    # Have to create agent workspace for multiple agents 
+
 
     # Initialize the RL hyperparameter agent with wider ranges for exploration
     agent = RLHyperparameterAgent(
@@ -321,6 +323,10 @@ def main():
         print("-" * 10)
         print(f"Epoch {epoch + 1}/{args.epochs}")
 
+
+
+        # have to get hyperparameters from multiple agent 
+        # use agent_coordinator here 
         # Get current hyperparameters from agent
         current_hyperparams = agent.get_current_hyperparameters()
         print(f"Current hyperparameters:")
@@ -333,6 +339,10 @@ def main():
         print(f"  Threshold: {current_hyperparams['threshold']:.2f}")
         print(f"  Include background: {current_hyperparams['include_background']}")
         print(f"  Normalization type: {current_hyperparams['normalization_type']}")
+
+
+        # Decisions agent makes 
+        # Need to import agent specific modules and 
 
         # Update post-processing threshold from agent
         post_pred = Compose([
@@ -434,15 +444,20 @@ def main():
                     current_hyperparams['normalization_type']
                 ])
 
+
+            # Agent coordinator updates with new metrics 
             # Update agent with new metrics
             agent_metrics = {
                 'dice_score': metric,
                 'val_loss': val_loss
             }
 
+            # Agent coordinator decides 
             # Let the agent decide on hyperparameter adjustments
             agent_action = agent.step(agent_metrics)
 
+
+            # Incorporate shared_state.py
             if agent_action['hyperparameters_changed']:
                 print(f"Agent adjusted {agent_action['parameter']} with action {agent_action['action']}")
                 print(f"  From: {agent_action['old_value']}")

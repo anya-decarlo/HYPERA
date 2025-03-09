@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 from monai.apps import download_and_extract
 from monai.config import print_config
-# import new hyperparamet
-# needs to be each hyperparamater and 
+from rl_hyperparameter_agent import RLHyperparameterAgent
+# from class_weights_agent import ClassWeightsAgent
 from monai.utils import set_determinism
 from monai.transforms import (
     Activations,
@@ -37,7 +37,7 @@ from monai.transforms import (
     Resized,
     NormalizeIntensityd,
     Orientationd,
-    Spacingd,
+    Spacingd
 )
 from monai.networks.nets import UNet
 from monai.networks.layers import Norm
@@ -48,7 +48,6 @@ from monai.losses import DiceLoss, DiceCELoss, FocalLoss
 from monai.handlers.utils import from_engine
 import nibabel as nib
 import argparse
-# won't generate synthethic data
 
 def main():
     # Parse command line arguments for hyperparameters
@@ -104,29 +103,15 @@ def main():
     with open(os.path.join(results_dir, "hyperparameters.json"), "w") as f:
         json.dump(vars(args), f, indent=4)
 
-    # Use existing synthetic dataset
-    data_dir = os.path.join(os.getcwd(), "SyntheticData")
-    print(f"Using existing synthetic dataset at: {data_dir}")
-    
-    # Load the dataset from the synthetic data directory
-    with open(os.path.join(data_dir, "dataset.json"), "r") as f:
-        dataset_info = json.load(f)
-    
-    # Create dataset dictionaries
-    data_dicts = []
-    for item in dataset_info["training"]:
-        data_dicts.append({
-            "image": os.path.join(data_dir, item["image"]),
-            "label": os.path.join(data_dir, item["label"]),
-        })
-    
-    # Split into training and validation
-    val_idx = int(len(data_dicts) * 0.2)
-    train_files = data_dicts[val_idx:]
-    val_files = data_dicts[:val_idx]
-
-    print(f"Training samples: {len(train_files)}")
-    print(f"Validation samples: {len(val_files)}")
+    from pathlib import Path
+    working_dir = Path.cwd()
+    data_path = working_dir / 'BBBC039_metadata/'
+    with open(data_path/ 'training.txt') as file:
+        training_names = set(file.read().split('.png\n'))
+    with open(data_path/ 'validation.txt') as file:
+        validation_names = set(file.read().split('.png\n'))
+    with open(data_path/ 'test.txt') as file:
+        test_names = set(file.read().split('.png\n'))
 
     # Define a fixed spatial size for all images based on patch size
     spatial_size = [args.patch_size, args.patch_size, args.patch_size]
@@ -170,9 +155,9 @@ def main():
         ]
     )
 
-    # Create datasets
-    train_ds = Dataset(data=train_files, transform=train_transforms)
-    val_ds = Dataset(data=val_files, transform=val_transforms)
+    train_files = [data_path / name for name in train_names]
+    val_files = [data_path / name for name in validation_names]
+    test_files = [data_path / name for name in test_names]
 
     # Create data loaders
     train_loader = DataLoader(
@@ -192,10 +177,10 @@ def main():
 
     # Create model
     model = UNet(
-        spatial_dims=2,
+        spatial_dims=3,
         in_channels=1,
-        out_channels=3,  # Background + 2 structures # possible 2 
-        channels=(64, 128, 256, 512),  # Simpler architecture with fewer channels
+        out_channels=3,  # Background + 2 structures
+        channels=(16, 32, 64, 128),  # Simpler architecture with fewer channels
         strides=(2, 2, 2),  # Fewer downsampling steps
         num_res_units=1,  # Fewer residual units
         dropout=args.dropout,
@@ -558,6 +543,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

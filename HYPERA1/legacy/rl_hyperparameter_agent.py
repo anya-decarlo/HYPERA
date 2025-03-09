@@ -124,7 +124,8 @@ class RLHyperparameterAgent:
         self.lambda_ce = initial_lambda_ce
         self.lambda_dice = initial_lambda_dice
         
-        self.class_weights = initial_class_weights or [1.0, 1.0, 1.0]
+        # changed clas weights to 4 
+        self.class_weights = initial_class_weights or [1.0, 1.0, 1.0, 1.0, 1.0]
         self.threshold = initial_threshold
         
         self.include_background = initial_include_background
