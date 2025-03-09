@@ -153,6 +153,29 @@ class SharedStateManager:
         
         return self.metrics_history[metric_name][-1]
     
+    def get_latest_metric(self, metric_name: str, default: float = 0.0) -> float:
+        """
+        Alias for get_metric_value for backward compatibility.
+        
+        Args:
+            metric_name: Name of the metric
+            default: Default value if metric not found
+            
+        Returns:
+            Most recent value of the metric
+        """
+        return self.get_metric_value(metric_name, default)
+    
+    def get_latest_metrics(self) -> Dict[str, float]:
+        """
+        Get the most recent values of all metrics.
+        
+        Returns:
+            Dictionary of metric names and their most recent values
+        """
+        return {metric_name: self.get_metric_value(metric_name) 
+                for metric_name in self.metrics_history.keys()}
+    
     def set_hyperparameter(self, name: str, value: Any) -> None:
         """
         Set a hyperparameter value.

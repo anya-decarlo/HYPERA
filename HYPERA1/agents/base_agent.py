@@ -63,6 +63,7 @@ class BaseHyperparameterAgent(ABC):
         auto_balance_components: bool = True,
         reward_clip_range: Tuple[float, float] = (-10.0, 10.0),
         reward_scaling_window: int = 100,
+        priority: int = 0,
     ):
         """
         Initialize the base hyperparameter agent.
@@ -98,11 +99,13 @@ class BaseHyperparameterAgent(ABC):
             auto_balance_components: Whether to auto-balance reward components
             reward_clip_range: Range for clipping rewards
             reward_scaling_window: Window size for reward statistics
+            priority: Priority of the agent
         """
         self.name = name
         self.hyperparameter_key = hyperparameter_key
         self.shared_state_manager = shared_state_manager
         self.device = device
+        self.priority = priority
         
         # SAC parameters
         self.state_dim = state_dim
@@ -235,6 +238,9 @@ class BaseHyperparameterAgent(ABC):
         # Add experiences to replay buffer
         if experiences:
             for exp in experiences:
+                # Amplify rewards to encourage more action
+                exp["reward"] = exp["reward"] * 2.0  # Amplify rewards
+                
                 self.sac.add_experience(
                     exp["state"],
                     exp["action"],
@@ -245,6 +251,11 @@ class BaseHyperparameterAgent(ABC):
         
         # Get latest reward components for logging
         reward_components = self.reward_system.get_latest_reward_components()
+        
+        # Amplify reward components to encourage more action
+        for key in reward_components:
+            if isinstance(reward_components[key], (int, float)):
+                reward_components[key] = reward_components[key] * 2.0
         
         # Update training phase information
         self.training_info["phase"] = reward_components.get("training_phase", "exploration")
@@ -283,7 +294,7 @@ class BaseHyperparameterAgent(ABC):
             )
         
         # Return the normalized and clipped reward
-        return reward_components.get("normalized_total", 0.0)
+        return reward_components.get("normalized_total", 0.0) * 2.0  # Amplify final reward
     
     @abstractmethod
     def _apply_action(self, processed_action: Any) -> None:
@@ -294,6 +305,20 @@ class BaseHyperparameterAgent(ABC):
             processed_action: The processed action to apply
         """
         pass
+    
+    def apply_action(self, action, epoch):
+        """
+        Apply the action selected by the agent.
+        
+        Args:
+            action: The action to apply
+            epoch: Current training epoch
+            
+        Returns:
+            Result of applying the action
+        """
+        processed_action = self._process_action(action)
+        return self._apply_action(processed_action)
     
     def should_update(self, epoch: int) -> bool:
         """
@@ -316,10 +341,7 @@ class BaseHyperparameterAgent(ABC):
         if epoch % self.update_frequency != 0:
             return False
         
-        # Only update after patience epochs without improvement
-        if self.epochs_without_improvement < self.patience:
-            return False
-        
+        # Always consider an update when frequency and cooldown conditions are met
         return True
     
     def update(self, metrics: Dict[str, float]) -> Dict[str, Any]:
@@ -420,7 +442,7 @@ class BaseHyperparameterAgent(ABC):
             'state': state.tolist(),
             'action': action.tolist(),
             'processed_action': hyperparameters,
-            'reward': reward,
+
             'epoch': self.current_epoch,
             'reward_components': self.reward_system.get_latest_reward_components()
         }
@@ -437,3 +459,12 @@ class BaseHyperparameterAgent(ABC):
             path: Path to load models from
         """
         self.sac.load_models(path)
+    
+    def get_param_name(self):
+        """
+        Get the name of the hyperparameter that this agent controls.
+        
+        Returns:
+            The hyperparameter key
+        """
+        return self.hyperparameter_key

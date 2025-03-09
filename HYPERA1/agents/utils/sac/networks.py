@@ -183,13 +183,11 @@ class GaussianPolicy(nn.Module):
         # Action space bounds
         self.action_dim = action_dim
         if action_space is None:
-            self.action_scale = torch.tensor(1.0)
-            self.action_bias = torch.tensor(0.0)
+            self.action_scale = torch.tensor([1.0])
+            self.action_bias = torch.tensor([0.0])
         else:
-            self.action_scale = torch.FloatTensor(
-                (action_space[1] - action_space[0]) / 2.0)
-            self.action_bias = torch.FloatTensor(
-                (action_space[1] + action_space[0]) / 2.0)
+            self.action_scale = torch.tensor([(action_space[1] - action_space[0]) / 2.0])
+            self.action_bias = torch.tensor([(action_space[1] + action_space[0]) / 2.0])
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -229,7 +227,7 @@ class GaussianPolicy(nn.Module):
             Tuple of (action, log_prob, mean)
         """
         mean, log_std = self.forward(state)
-        std = log_std.exp()
+        std = log_std.exp() * 1.5  # Increase exploration by scaling up the standard deviation
         
         # Sample from Gaussian distribution
         normal = Normal(mean, std)

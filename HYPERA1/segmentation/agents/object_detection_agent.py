@@ -2,6 +2,7 @@
 # Object Detection Agent - Specialized agent for optimizing object-level metrics
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,8 +13,11 @@ import time
 from skimage.measure import label, regionprops
 from scipy.optimize import linear_sum_assignment
 
-from ..base_segmentation_agent import BaseSegmentationAgent
-from ..segmentation_state_manager import SegmentationStateManager
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.base_segmentation_agent import BaseSegmentationAgent
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
 
 class ObjectDetectionAgent(BaseSegmentationAgent):
     """
@@ -44,9 +48,19 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
         self,
         state_manager: SegmentationStateManager,
         device: torch.device = None,
-        learning_rate: float = 0.001,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
         gamma: float = 0.99,
-        update_frequency: int = 10,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        lr: float = 3e-4,
+        automatic_entropy_tuning: bool = True,
+        update_frequency: int = 1,
+        log_dir: str = "logs",
         verbose: bool = False
     ):
         """
@@ -55,115 +69,259 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
         Args:
             state_manager: Manager for shared state
             device: Device to use for computation
-            learning_rate: Learning rate for optimizer
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
             gamma: Discount factor for future rewards
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            lr: Learning rate
+            automatic_entropy_tuning: Whether to automatically tune entropy
             update_frequency: Frequency of agent updates
+            log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
+        # Store feature extraction parameters
+        self.feature_channels = 32
+        self.hidden_channels = 64
+        
         super().__init__(
             name="ObjectDetectionAgent",
             state_manager=state_manager,
             device=device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=verbose
         )
         
-        # Initialize object detection-specific components
-        self._init_object_detection_components()
-        
         if self.verbose:
             self.logger.info("Initialized ObjectDetectionAgent")
-    
-    def _init_object_detection_components(self):
+            
+    def _initialize_agent(self):
         """
-        Initialize object detection-specific components.
+        Initialize the agent's networks and components.
         """
-        # Feature extractor for object detection features
+        # Feature extractor for processing segmentation masks
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(1, self.feature_channels, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(self.feature_channels, self.hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((8, 8))
+            nn.Flatten()
         ).to(self.device)
         
-        # Policy network for object detection-specific actions
-        self.policy_network = nn.Sequential(
-            nn.Linear(64 * 8 * 8 + 4, 256),  # +4 for object metrics
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)  # 3 actions: increase, decrease, or maintain object sensitivity
-        ).to(self.device)
-        
-        # Optimizer for policy network
-        self.optimizer = torch.optim.Adam(
-            list(self.feature_extractor.parameters()) + list(self.policy_network.parameters()),
-            lr=self.learning_rate
-        )
-        
-        # Object detection-specific parameters
+        # Initialize object detection specific components
+        self.detection_threshold = 0.5  # Threshold for object detection
         self.min_object_size = 10  # Minimum object size in pixels
-        self.object_sensitivity = 0.5  # Sensitivity for object detection (threshold)
-        self.min_sensitivity = 0.1
-        self.max_sensitivity = 0.9
-        self.sensitivity_step = 0.05
         
-        # Object detection history
-        self.object_count_history = []
-        self.object_iou_history = []
+        if self.verbose:
+            self.logger.info("Initialized ObjectDetectionAgent networks and components")
     
-    def observe(self) -> Dict[str, Any]:
+    def _extract_features(self, observation):
         """
-        Observe the current state.
+        Extract features from the observation.
         
+        Args:
+            observation: Dictionary containing observation data
+            
         Returns:
-            Dictionary of observations
+            Extracted features
         """
-        # Get current state from state manager
-        current_image = self.state_manager.get_current_image()
-        current_mask = self.state_manager.get_current_mask()
-        current_prediction = self.state_manager.get_current_prediction()
+        # Get current segmentation and ground truth
+        current_seg = observation.get("current_segmentation", None)
+        ground_truth = observation.get("ground_truth", None)
         
-        if current_image is None or current_mask is None or current_prediction is None:
-            # If any required state is missing, return empty observation
-            return {}
+        if current_seg is None or ground_truth is None:
+            return {"features": torch.zeros(self.state_dim, device=self.device)}
         
         # Ensure tensors are on the correct device
-        current_image = current_image.to(self.device)
-        current_mask = current_mask.to(self.device)
-        current_prediction = current_prediction.to(self.device)
+        if isinstance(current_seg, np.ndarray):
+            current_seg = torch.from_numpy(current_seg).float().to(self.device)
+        if isinstance(ground_truth, np.ndarray):
+            ground_truth = torch.from_numpy(ground_truth).float().to(self.device)
+        
+        # Add batch and channel dimensions if needed
+        if current_seg.dim() == 2:
+            current_seg = current_seg.unsqueeze(0).unsqueeze(0)
+        elif current_seg.dim() == 3:
+            current_seg = current_seg.unsqueeze(0)
+            
+        if ground_truth.dim() == 2:
+            ground_truth = ground_truth.unsqueeze(0).unsqueeze(0)
+        elif ground_truth.dim() == 3:
+            ground_truth = ground_truth.unsqueeze(0)
+        
+        # Extract features using the feature extractor
+        with torch.no_grad():
+            features = self.feature_extractor(current_seg)
         
         # Calculate object-level metrics
-        object_metrics = self._calculate_object_metrics(current_prediction, current_mask)
+        object_metrics = self._calculate_object_metrics(current_seg.squeeze().cpu().numpy(), 
+                                                       ground_truth.squeeze().cpu().numpy())
         
-        # Get recent metrics from state manager
-        recent_metrics = self.state_manager.get_recent_metrics()
-        
-        # Create observation dictionary
-        observation = {
-            "current_image": current_image,
-            "current_mask": current_mask,
-            "current_prediction": current_prediction,
-            "object_metrics": object_metrics,
-            "recent_metrics": recent_metrics,
-            "object_sensitivity": self.object_sensitivity
+        # Combine features with object metrics
+        combined_features = {
+            "features": features,
+            "object_metrics": object_metrics
         }
         
-        # Store observation in history
-        self.observation_history.append(observation)
-        
-        return observation
+        return combined_features
     
-    def _calculate_object_metrics(self, prediction: torch.Tensor, ground_truth: torch.Tensor) -> Dict[str, float]:
+    def get_state_representation(self, observation):
+        """
+        Get state representation from observation.
+        
+        Args:
+            observation: Dictionary containing observation data
+            
+        Returns:
+            State representation
+        """
+        # Extract features from observation
+        features = self._extract_features(observation)
+        
+        # Get the extracted feature tensor
+        feature_tensor = features["features"]
+        
+        # Ensure the feature tensor has the correct shape
+        if feature_tensor.shape[0] != self.state_dim:
+            # Resize to match state_dim using adaptive pooling
+            feature_tensor = F.adaptive_avg_pool1d(feature_tensor.unsqueeze(0), self.state_dim).squeeze(0)
+        
+        # Convert to numpy array for SAC
+        state = feature_tensor.cpu().numpy()
+        
+        return state
+    
+    def apply_action(self, action):
+        """
+        Apply the selected action to modify the segmentation.
+        
+        Args:
+            action: Action to apply
+            
+        Returns:
+            Modified segmentation
+        """
+        # Get current segmentation
+        current_seg = self.state_manager.get_current_segmentation()
+        
+        if current_seg is None:
+            return None
+        
+        # Convert to tensor if needed
+        if isinstance(current_seg, np.ndarray):
+            current_seg = torch.from_numpy(current_seg).float().to(self.device)
+        
+        # Add batch and channel dimensions if needed
+        if current_seg.dim() == 2:
+            current_seg = current_seg.unsqueeze(0).unsqueeze(0)
+        elif current_seg.dim() == 3:
+            current_seg = current_seg.unsqueeze(0)
+        
+        # Apply action to modify detection threshold and min object size
+        # Scale action from [-1, 1] to appropriate ranges
+        detection_threshold_delta = action[0] * 0.1  # Scale to [-0.1, 0.1]
+        self.detection_threshold = np.clip(self.detection_threshold + detection_threshold_delta, 0.1, 0.9)
+        
+        if action.shape[0] > 1:
+            min_size_delta = action[1] * 5  # Scale to [-5, 5]
+            self.min_object_size = max(1, self.min_object_size + int(min_size_delta))
+        
+        # Apply thresholding
+        thresholded = (current_seg > self.detection_threshold).float()
+        
+        # Remove small objects (on CPU for skimage compatibility)
+        labeled = label(thresholded.squeeze().cpu().numpy())
+        for region in regionprops(labeled):
+            if region.area < self.min_object_size:
+                labeled[labeled == region.label] = 0
+        
+        # Convert back to binary mask
+        filtered = (labeled > 0).astype(np.float32)
+        
+        # Convert back to tensor and return
+        filtered_tensor = torch.from_numpy(filtered).float().to(self.device)
+        
+        # Update the segmentation in the state manager
+        self.state_manager.update_segmentation(filtered_tensor.cpu().numpy())
+        
+        return filtered_tensor
+    
+    def _save_agent_state(self, path):
+        """
+        Save agent state to file.
+        
+        Args:
+            path: Path to save agent state
+        """
+        save_dict = {
+            "feature_extractor": self.feature_extractor.state_dict(),
+            "detection_threshold": self.detection_threshold,
+            "min_object_size": self.min_object_size
+        }
+        
+        torch.save(save_dict, path)
+        
+        if self.verbose:
+            self.logger.info(f"Saved ObjectDetectionAgent state to {path}")
+    
+    def _load_agent_state(self, path):
+        """
+        Load agent state from file.
+        
+        Args:
+            path: Path to load agent state from
+        """
+        if not os.path.exists(path):
+            if self.verbose:
+                self.logger.warning(f"Agent state file {path} does not exist")
+            return False
+        
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
+            
+            self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
+            self.detection_threshold = checkpoint.get("detection_threshold", 0.5)
+            self.min_object_size = checkpoint.get("min_object_size", 10)
+            
+            if self.verbose:
+                self.logger.info(f"Loaded ObjectDetectionAgent state from {path}")
+            
+            return True
+        except Exception as e:
+            if self.verbose:
+                self.logger.error(f"Failed to load agent state: {e}")
+            return False
+    
+    def _reset_agent(self):
+        """
+        Reset the agent to its initial state.
+        """
+        # Reset object detection specific parameters
+        self.detection_threshold = 0.5
+        self.min_object_size = 10
+        
+        if self.verbose:
+            self.logger.info("Reset ObjectDetectionAgent")
+    
+    def _calculate_object_metrics(self, prediction: np.ndarray, ground_truth: np.ndarray) -> Dict[str, float]:
         """
         Calculate object-level metrics.
         
@@ -174,25 +332,9 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
         Returns:
             Dictionary of object-level metrics
         """
-        # Convert tensors to numpy arrays
-        pred_np = (prediction > self.object_sensitivity).float().cpu().numpy()
-        gt_np = (ground_truth > 0.5).float().cpu().numpy()
-        
-        # Remove batch dimension if present
-        if pred_np.ndim > 3:
-            pred_np = pred_np[0]
-        if gt_np.ndim > 3:
-            gt_np = gt_np[0]
-        
-        # Remove channel dimension if present
-        if pred_np.ndim > 2:
-            pred_np = pred_np[0]
-        if gt_np.ndim > 2:
-            gt_np = gt_np[0]
-        
         # Label connected components (objects)
-        pred_labels = label(pred_np > 0.5)
-        gt_labels = label(gt_np > 0.5)
+        pred_labels = label(prediction > 0.5)
+        gt_labels = label(ground_truth > 0.5)
         
         # Get region properties
         pred_props = regionprops(pred_labels)
@@ -256,278 +398,4 @@ class ObjectDetectionAgent(BaseSegmentationAgent):
             "f1_score": f1_score
         }
         
-        # Update history
-        self.object_count_history.append((pred_count, gt_count))
-        self.object_iou_history.append(mean_iou)
-        
         return object_metrics
-    
-    def decide(self, observation: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Decide on an action based on the observation.
-        
-        Args:
-            observation: Dictionary of observations
-            
-        Returns:
-            Dictionary of actions
-        """
-        if not observation:
-            # If observation is empty, return no action
-            return {}
-        
-        # Extract features from current image
-        current_image = observation["current_image"]
-        
-        # Ensure image has channel dimension
-        if len(current_image.shape) == 3:
-            current_image = current_image.unsqueeze(1)
-        
-        # Extract features
-        features = self.feature_extractor(current_image)
-        features = features.view(features.size(0), -1)
-        
-        # Add object metrics to features
-        object_metrics = observation["object_metrics"]
-        
-        # Create object metrics tensor
-        metrics_tensor = torch.tensor([
-            [
-                object_metrics["count_accuracy"],
-                object_metrics["mean_iou"],
-                object_metrics["precision"],
-                object_metrics["recall"]
-            ]
-        ], device=self.device)
-        
-        # Concatenate features with object metrics
-        extended_features = torch.cat([features, metrics_tensor], dim=1)
-        
-        # Get action logits from policy network
-        action_logits = self.policy_network(extended_features)
-        
-        # Apply softmax to get action probabilities
-        action_probs = F.softmax(action_logits, dim=1)
-        
-        # Sample action from probabilities
-        if self.training:
-            action = torch.multinomial(action_probs, 1).item()
-        else:
-            action = torch.argmax(action_probs, dim=1).item()
-        
-        # Map action to object sensitivity adjustment
-        if action == 0:
-            # Increase sensitivity (decreases threshold)
-            new_sensitivity = max(self.object_sensitivity - self.sensitivity_step, self.min_sensitivity)
-        elif action == 1:
-            # Decrease sensitivity (increases threshold)
-            new_sensitivity = min(self.object_sensitivity + self.sensitivity_step, self.max_sensitivity)
-        else:
-            # Maintain current sensitivity
-            new_sensitivity = self.object_sensitivity
-        
-        # Create action dictionary
-        action_dict = {
-            "object_sensitivity": new_sensitivity,
-            "action_type": action,
-            "action_probs": action_probs.detach().cpu().numpy(),
-            "current_sensitivity": self.object_sensitivity,
-            "object_metrics": object_metrics
-        }
-        
-        # Store action in history
-        self.action_history.append(action_dict)
-        
-        # Update object sensitivity
-        self.object_sensitivity = new_sensitivity
-        
-        return action_dict
-    
-    def learn(self, reward: float) -> Dict[str, float]:
-        """
-        Learn from the reward.
-        
-        Args:
-            reward: Reward value
-            
-        Returns:
-            Dictionary of learning metrics
-        """
-        # Store reward in history
-        self.reward_history.append(reward)
-        
-        # Check if it's time to update
-        current_step = self.state_manager.get_current_step()
-        if current_step - self.last_update_step < self.update_frequency:
-            return {}
-        
-        # Update last update step
-        self.last_update_step = current_step
-        
-        # Check if we have enough history for learning
-        if len(self.action_history) < 2 or len(self.reward_history) < 2:
-            return {}
-        
-        # Get the most recent observation, action, and reward
-        observation = self.observation_history[-1]
-        action = self.action_history[-1]
-        
-        # Extract features from current image
-        current_image = observation["current_image"]
-        
-        # Ensure image has channel dimension
-        if len(current_image.shape) == 3:
-            current_image = current_image.unsqueeze(1)
-        
-        # Extract features
-        features = self.feature_extractor(current_image)
-        features = features.view(features.size(0), -1)
-        
-        # Add object metrics to features
-        object_metrics = observation["object_metrics"]
-        
-        # Create object metrics tensor
-        metrics_tensor = torch.tensor([
-            [
-                object_metrics["count_accuracy"],
-                object_metrics["mean_iou"],
-                object_metrics["precision"],
-                object_metrics["recall"]
-            ]
-        ], device=self.device)
-        
-        # Concatenate features with object metrics
-        extended_features = torch.cat([features, metrics_tensor], dim=1)
-        
-        # Get action logits from policy network
-        action_logits = self.policy_network(extended_features)
-        
-        # Calculate policy loss using REINFORCE algorithm
-        action_type = action["action_type"]
-        policy_loss = -action_logits[0, action_type] * reward
-        
-        # Backpropagate and optimize
-        self.optimizer.zero_grad()
-        policy_loss.backward()
-        self.optimizer.step()
-        
-        # Create learning metrics dictionary
-        metrics = {
-            "policy_loss": policy_loss.item(),
-            "reward": reward,
-            "object_sensitivity": self.object_sensitivity,
-            "count_accuracy": object_metrics["count_accuracy"],
-            "mean_iou": object_metrics["mean_iou"],
-            "precision": object_metrics["precision"],
-            "recall": object_metrics["recall"],
-            "f1_score": object_metrics["f1_score"]
-        }
-        
-        return metrics
-    
-    def get_state(self) -> Dict[str, Any]:
-        """
-        Get the current state of the agent.
-        
-        Returns:
-            Dictionary of agent state
-        """
-        return {
-            "name": self.name,
-            "object_sensitivity": self.object_sensitivity,
-            "min_object_size": self.min_object_size,
-            "learning_rate": self.learning_rate,
-            "gamma": self.gamma,
-            "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history_length": len(self.action_history),
-            "reward_history_length": len(self.reward_history),
-            "observation_history_length": len(self.observation_history),
-            "training": self.training
-        }
-    
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """
-        Set the state of the agent.
-        
-        Args:
-            state: Dictionary of agent state
-        """
-        if "object_sensitivity" in state:
-            self.object_sensitivity = state["object_sensitivity"]
-        
-        if "min_object_size" in state:
-            self.min_object_size = state["min_object_size"]
-        
-        if "learning_rate" in state:
-            self.learning_rate = state["learning_rate"]
-            # Update optimizer with new learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = self.learning_rate
-        
-        if "gamma" in state:
-            self.gamma = state["gamma"]
-        
-        if "update_frequency" in state:
-            self.update_frequency = state["update_frequency"]
-        
-        if "training" in state:
-            self.training = state["training"]
-    
-    def save(self, path: str) -> None:
-        """
-        Save the agent to a file.
-        
-        Args:
-            path: Path to save the agent
-        """
-        # Create state dictionary
-        state_dict = {
-            "feature_extractor": self.feature_extractor.state_dict(),
-            "policy_network": self.policy_network.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "object_sensitivity": self.object_sensitivity,
-            "min_object_size": self.min_object_size,
-            "learning_rate": self.learning_rate,
-            "gamma": self.gamma,
-            "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history": self.action_history,
-            "reward_history": self.reward_history,
-            "training": self.training
-        }
-        
-        # Save state dictionary
-        torch.save(state_dict, path)
-        
-        if self.verbose:
-            self.logger.info(f"Saved ObjectDetectionAgent to {path}")
-    
-    def load(self, path: str) -> None:
-        """
-        Load the agent from a file.
-        
-        Args:
-            path: Path to load the agent from
-        """
-        # Load state dictionary
-        state_dict = torch.load(path, map_location=self.device)
-        
-        # Load model parameters
-        self.feature_extractor.load_state_dict(state_dict["feature_extractor"])
-        self.policy_network.load_state_dict(state_dict["policy_network"])
-        self.optimizer.load_state_dict(state_dict["optimizer"])
-        
-        # Load agent parameters
-        self.object_sensitivity = state_dict["object_sensitivity"]
-        self.min_object_size = state_dict["min_object_size"]
-        self.learning_rate = state_dict["learning_rate"]
-        self.gamma = state_dict["gamma"]
-        self.update_frequency = state_dict["update_frequency"]
-        self.last_update_step = state_dict["last_update_step"]
-        self.action_history = state_dict["action_history"]
-        self.reward_history = state_dict["reward_history"]
-        self.training = state_dict["training"]
-        
-        if self.verbose:
-            self.logger.info(f"Loaded ObjectDetectionAgent from {path}")

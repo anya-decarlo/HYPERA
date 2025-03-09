@@ -23,8 +23,8 @@ class WeightDecayAgent(BaseHyperparameterAgent):
         self,
         shared_state_manager: SharedStateManager,
         initial_weight_decay: float = 1e-5,
-        min_weight_decay: float = 1e-8,
-        max_weight_decay: float = 1e-2,
+        min_wd: float = 1e-8,
+        max_wd: float = 1e-2,
         update_frequency: int = 5,  # Less frequent updates than learning rate
         patience: int = 5,
         cooldown: int = 10,
@@ -38,63 +38,97 @@ class WeightDecayAgent(BaseHyperparameterAgent):
         n_step: int = 3,
         stability_weight: float = 0.3,
         generalization_weight: float = 0.4,
-        efficiency_weight: float = 0.3
+        efficiency_weight: float = 0.3,
+        use_adaptive_scaling: bool = True,
+        use_phase_aware_scaling: bool = True,
+        auto_balance_components: bool = True,
+        reward_clip_range: Optional[Tuple[float, float]] = None,
+        reward_scaling_window: int = 100,
+        device: Optional[torch.device] = None,
+        name: str = "weight_decay_agent",
+        priority: int = 0
     ):
         """
         Initialize the weight decay agent.
         
         Args:
-            shared_state_manager: Manager for shared state across agents
+            shared_state_manager: Manager for shared state between agents
             initial_weight_decay: Initial weight decay value
-            min_weight_decay: Minimum allowed weight decay
-            max_weight_decay: Maximum allowed weight decay
-            update_frequency: How often to consider updates (in epochs)
+            min_wd: Minimum weight decay
+            max_wd: Maximum weight decay
+            update_frequency: How often to update the weight decay (in epochs)
             patience: Epochs to wait before considering action
             cooldown: Epochs to wait after an action
-            log_dir: Directory for saving logs
+            log_dir: Directory for saving logs and agent states
             verbose: Whether to print verbose output
-            metrics_to_track: List of metrics to include in state representation
-            state_dim: Dimension of state representation
-            hidden_dim: Hidden dimension for SAC networks
+            metrics_to_track: List of metrics to track
+            state_dim: Dimension of state space
+            hidden_dim: Dimension of hidden layers
             use_enhanced_state: Whether to use enhanced state representation
-            eligibility_trace_length: Length of eligibility traces for reward calculation
+            eligibility_trace_length: Length of eligibility traces
             n_step: Number of steps for n-step returns
-            stability_weight: Weight for stability component in reward
-            generalization_weight: Weight for generalization component in reward
-            efficiency_weight: Weight for efficiency component in reward
+            stability_weight: Weight for stability component of reward
+            generalization_weight: Weight for generalization component of reward
+            efficiency_weight: Weight for efficiency component of reward
+            use_adaptive_scaling: Whether to use adaptive reward scaling
+            use_phase_aware_scaling: Whether to use phase-aware scaling
+            auto_balance_components: Whether to auto-balance reward components
+            reward_clip_range: Range for clipping rewards
+            reward_scaling_window: Window size for reward statistics
+            device: Device to use for training
+            name: Name of agent
+            priority: Priority of the agent (higher means more important)
         """
+        # Set default device if not provided
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        # Set default reward clip range if not provided
+        if reward_clip_range is None:
+            reward_clip_range = (-10.0, 10.0)
+            
         super().__init__(
-            name="weight_decay",
+            name=name,
             hyperparameter_key="weight_decay",
             shared_state_manager=shared_state_manager,
             state_dim=state_dim,
-            action_dim=1,  # Weight decay adjustment is a 1D action
-            action_space=(-1.0, 1.0),  # Normalized action space
+            action_dim=1,
+            action_space=(-1.0, 1.0),
             hidden_dim=hidden_dim,
             update_frequency=update_frequency,
             patience=patience,
             cooldown=cooldown,
             log_dir=log_dir,
             verbose=verbose,
+            device=device,
             eligibility_trace_length=eligibility_trace_length,
             n_step=n_step,
             stability_weight=stability_weight,
             generalization_weight=generalization_weight,
-            efficiency_weight=efficiency_weight
+            efficiency_weight=efficiency_weight,
+            use_adaptive_scaling=use_adaptive_scaling,
+            use_phase_aware_scaling=use_phase_aware_scaling,
+            auto_balance_components=auto_balance_components,
+            reward_clip_range=reward_clip_range,
+            reward_scaling_window=reward_scaling_window,
+            priority=priority
         )
         
         # Weight decay specific parameters
-        self.min_weight_decay = min_weight_decay
-        self.max_weight_decay = max_weight_decay
+        self.min_weight_decay = min_wd
+        self.max_weight_decay = max_wd
         self.metrics_to_track = metrics_to_track
         self.use_enhanced_state = use_enhanced_state
         
         # Initialize weight decay
         self.current_weight_decay = initial_weight_decay
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_weight_decay)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_weight_decay)
+        
+        # Add epochs_since_update attribute
+        self.epochs_since_update = 0
         
         # Log initialization
-        self.log(f"Initialized with weight_decay={self.current_weight_decay}")
+        logging.info(f"Initialized with weight_decay={self.current_weight_decay}")
     
     def get_state_representation(self) -> np.ndarray:
         """
@@ -270,10 +304,10 @@ class WeightDecayAgent(BaseHyperparameterAgent):
         self.current_weight_decay = new_weight_decay
         
         # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_weight_decay)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_weight_decay)
         
         # Log update
-        self.log(f"Updated weight_decay: {old_weight_decay:.8f} -> {self.current_weight_decay:.8f} (factor: {relative_change:.2f})")
+        logging.info(f"Updated weight_decay: {old_weight_decay:.8f} -> {self.current_weight_decay:.8f} (factor: {relative_change:.2f})")
         
         # Return update info
         return {
@@ -283,7 +317,7 @@ class WeightDecayAgent(BaseHyperparameterAgent):
             "hyperparameter": self.hyperparameter_key
         }
     
-    def _process_action(self, action: np.ndarray) -> float:
+    def _process_action(self, action):
         """
         Process the action from SAC to get the new weight decay.
         
@@ -293,24 +327,52 @@ class WeightDecayAgent(BaseHyperparameterAgent):
         Returns:
             New weight decay value
         """
-        return self.action_to_hyperparameter(action[0])
+        # Handle both scalar and array/list actions
+        if isinstance(action, (list, np.ndarray)):
+            return self.action_to_hyperparameter(action[0])
+        else:
+            return self.action_to_hyperparameter(action)
     
     def _apply_action(self, new_weight_decay: float) -> None:
         """
-        Apply the new weight decay.
+        Apply the new weight decay value.
         
         Args:
             new_weight_decay: New weight decay value
         """
-        # Update current value
-        old_weight_decay = self.current_weight_decay
         self.current_weight_decay = new_weight_decay
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, new_weight_decay)
         
-        # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_weight_decay)
+        if self.verbose:
+            logging.info(f"Weight decay updated to {new_weight_decay:.6f}")
+    
+    def select_action(self, epoch: int) -> Optional[float]:
+        """
+        Select an action based on the current state.
         
-        # Log update
-        self.log(f"Updated weight_decay: {old_weight_decay:.8f} -> {self.current_weight_decay:.8f}")
+        Args:
+            epoch: Current training epoch
+            
+        Returns:
+            Action value or None if no action should be taken
+        """
+        if not self.should_update(epoch):
+            return None
+            
+        state = self.get_state_representation()
+        action = self.sac.select_action(state)
+        processed_action = self._process_action(action)
+        
+        return processed_action
+    
+    def get_current_weight_decay(self) -> float:
+        """
+        Get the current weight decay value.
+        
+        Returns:
+            Current weight decay value
+        """
+        return self.current_weight_decay
     
     def _get_state_representation(self) -> np.ndarray:
         """

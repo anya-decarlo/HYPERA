@@ -2,15 +2,19 @@
 # Segmentation Agent Coordinator - Manages and coordinates specialized segmentation agents
 
 import os
+import sys
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
 
-from .segmentation_agent_factory import SegmentationAgentFactory
-from ..segmentation_state_manager import SegmentationStateManager
-from ..rewards.multi_objective_reward import MultiObjectiveRewardCalculator
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.agents.segmentation_agent_factory import SegmentationAgentFactory
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
+from HYPERA1.segmentation.rewards.multi_objective_reward import MultiObjectiveRewardCalculator
 
 class SegmentationAgentCoordinator:
     """

@@ -2,6 +2,7 @@
 # Boundary Agent - Specialized agent for optimizing boundary accuracy
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,8 +11,11 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
 
-from ..base_segmentation_agent import BaseSegmentationAgent
-from ..segmentation_state_manager import SegmentationStateManager
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.base_segmentation_agent import BaseSegmentationAgent
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
 
 class BoundaryAgent(BaseSegmentationAgent):
     """
@@ -41,9 +45,19 @@ class BoundaryAgent(BaseSegmentationAgent):
         self,
         state_manager: SegmentationStateManager,
         device: torch.device = None,
-        learning_rate: float = 0.001,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
         gamma: float = 0.99,
-        update_frequency: int = 5,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        lr: float = 3e-4,
+        automatic_entropy_tuning: bool = True,
+        update_frequency: int = 1,
+        log_dir: str = "logs",
         verbose: bool = False
     ):
         """
@@ -52,18 +66,38 @@ class BoundaryAgent(BaseSegmentationAgent):
         Args:
             state_manager: Manager for shared state
             device: Device to use for computation
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
-            update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            gamma: Discount factor
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            lr: Learning rate
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            update_frequency: How often the agent should update (in steps)
+            log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
         super().__init__(
             name="BoundaryAgent",
             state_manager=state_manager,
             device=device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=verbose
         )
         
@@ -104,7 +138,7 @@ class BoundaryAgent(BaseSegmentationAgent):
         # Optimizer for policy network
         self.optimizer = torch.optim.Adam(
             list(self.feature_extractor.parameters()) + list(self.policy_network.parameters()),
-            lr=self.learning_rate
+            lr=self.lr
         )
         
         # Boundary-specific parameters
@@ -482,3 +516,239 @@ class BoundaryAgent(BaseSegmentationAgent):
         
         if self.verbose:
             self.logger.info(f"Loaded BoundaryAgent from {path}")
+    
+    def _initialize_agent(self):
+        """
+        Initialize agent-specific parameters and networks.
+        """
+        # Use existing _init_boundary_components method
+        self._init_boundary_components()
+    
+    def _extract_features(self, observation: torch.Tensor) -> Dict[str, Any]:
+        """
+        Extract boundary-specific features from the observation.
+        
+        Args:
+            observation: The current observation
+            
+        Returns:
+            Dictionary of extracted features
+        """
+        # Get current state from state manager
+        current_image = self.state_manager.get_current_image()
+        current_mask = self.state_manager.get_current_mask()
+        current_prediction = self.state_manager.get_current_prediction()
+        
+        if current_image is None or current_mask is None or current_prediction is None:
+            # If any required state is missing, return empty features
+            return {}
+        
+        # Ensure tensors are on the correct device
+        current_image = current_image.to(self.device)
+        current_mask = current_mask.to(self.device)
+        current_prediction = current_prediction.to(self.device)
+        
+        # Extract boundaries from mask and prediction
+        gt_boundary = self._extract_boundary(current_mask)
+        pred_boundary = self._extract_boundary(current_prediction)
+        
+        # Calculate boundary accuracy metrics
+        hausdorff_distance = self._calculate_hausdorff_distance(pred_boundary, gt_boundary)
+        boundary_dice = self._calculate_boundary_dice(pred_boundary, gt_boundary)
+        
+        # Create features dictionary
+        features = {
+            "current_image": current_image,
+            "gt_boundary": gt_boundary,
+            "pred_boundary": pred_boundary,
+            "hausdorff_distance": hausdorff_distance,
+            "boundary_dice": boundary_dice,
+            "boundary_sensitivity": self.boundary_sensitivity
+        }
+        
+        return features
+    
+    def get_state_representation(self, observation: torch.Tensor) -> np.ndarray:
+        """
+        Extract a state representation from the observation.
+        
+        Args:
+            observation: The current observation
+            
+        Returns:
+            State representation as a numpy array
+        """
+        # Get features
+        features = self._extract_features(observation)
+        
+        if not features:
+            # Return zero state if features are empty
+            return np.zeros(self.state_dim, dtype=np.float32)
+        
+        # Extract boundary features using feature extractor
+        current_image = features["current_image"]
+        pred_boundary = features["pred_boundary"]
+        
+        # Combine image and predicted boundary for feature extraction
+        combined_input = torch.cat([
+            current_image.unsqueeze(1),
+            pred_boundary.unsqueeze(1)
+        ], dim=1)
+        
+        # Extract features using the feature extractor
+        with torch.no_grad():
+            boundary_features = self.feature_extractor(combined_input)
+            boundary_features = boundary_features.view(-1).cpu().numpy()
+        
+        # Add scalar metrics to the state
+        state = np.zeros(self.state_dim, dtype=np.float32)
+        
+        # Fill in the state with boundary features (truncate or pad as needed)
+        feature_size = min(len(boundary_features), self.state_dim - 2)
+        state[:feature_size] = boundary_features[:feature_size]
+        
+        # Add scalar metrics to the state
+        if "hausdorff_distance" in features:
+            state[-2] = features["hausdorff_distance"]
+        if "boundary_dice" in features:
+            state[-1] = features["boundary_dice"]
+        
+        return state
+    
+    def apply_action(self, action: np.ndarray, features: Dict[str, Any]) -> torch.Tensor:
+        """
+        Apply the action to produce a segmentation decision.
+        
+        Args:
+            action: Action from the SAC policy
+            features: Dictionary of extracted features
+            
+        Returns:
+            Segmentation decision tensor
+        """
+        if not features:
+            # Return None if features are empty
+            return None
+        
+        # Get current prediction from state manager
+        current_prediction = self.state_manager.get_current_prediction()
+        if current_prediction is None:
+            return None
+        
+        # Ensure prediction is on the correct device
+        current_prediction = current_prediction.to(self.device)
+        
+        # Interpret the action
+        # Action is a continuous value that we map to boundary sensitivity
+        # We map the action range (-1, 1) to a sensitivity adjustment
+        sensitivity_adjustment = action[0] * self.sensitivity_step
+        
+        # Update boundary sensitivity
+        new_sensitivity = self.boundary_sensitivity + sensitivity_adjustment
+        new_sensitivity = max(self.min_sensitivity, min(self.max_sensitivity, new_sensitivity))
+        self.boundary_sensitivity = new_sensitivity
+        
+        # Re-extract boundaries with the new sensitivity
+        pred_boundary = self._extract_boundary(current_prediction)
+        
+        # Apply boundary refinement to the current prediction
+        refined_prediction = self._refine_prediction(current_prediction, pred_boundary)
+        
+        return refined_prediction
+    
+    def _refine_prediction(self, prediction: torch.Tensor, boundary: torch.Tensor) -> torch.Tensor:
+        """
+        Refine the prediction using boundary information.
+        
+        Args:
+            prediction: Current prediction tensor
+            boundary: Extracted boundary tensor
+            
+        Returns:
+            Refined prediction tensor
+        """
+        # Simple refinement: dilate the boundary and use it to refine the prediction
+        # This is a placeholder implementation
+        kernel_size = 3
+        padding = kernel_size // 2
+        
+        # Dilate the boundary
+        dilated_boundary = F.max_pool2d(
+            boundary.unsqueeze(1),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding
+        ).squeeze(1)
+        
+        # Use the dilated boundary to refine the prediction
+        # This is a simple approach that can be improved
+        refined_prediction = prediction.clone()
+        
+        # Where the boundary is active, make the prediction more decisive
+        # (closer to 0 or 1)
+        boundary_mask = dilated_boundary > 0.5
+        refined_prediction[boundary_mask] = torch.where(
+            refined_prediction[boundary_mask] > 0.5,
+            torch.ones_like(refined_prediction[boundary_mask]),
+            torch.zeros_like(refined_prediction[boundary_mask])
+        )
+        
+        return refined_prediction
+    
+    def _save_agent_state(self, save_dict: Dict[str, Any]):
+        """
+        Add agent-specific state to the save dictionary.
+        
+        Args:
+            save_dict: Dictionary to add agent-specific state to
+        """
+        # Save boundary-specific parameters
+        save_dict["boundary_sensitivity"] = self.boundary_sensitivity
+        save_dict["min_sensitivity"] = self.min_sensitivity
+        save_dict["max_sensitivity"] = self.max_sensitivity
+        save_dict["sensitivity_step"] = self.sensitivity_step
+        
+        # Save network states
+        save_dict["feature_extractor_state"] = self.feature_extractor.state_dict()
+        save_dict["policy_network_state"] = self.policy_network.state_dict()
+    
+    def _load_agent_state(self, checkpoint: Dict[str, Any]) -> bool:
+        """
+        Load agent-specific state from the checkpoint.
+        
+        Args:
+            checkpoint: Dictionary containing the agent state
+            
+        Returns:
+            Whether the load was successful
+        """
+        try:
+            # Load boundary-specific parameters
+            self.boundary_sensitivity = checkpoint.get("boundary_sensitivity", self.boundary_sensitivity)
+            self.min_sensitivity = checkpoint.get("min_sensitivity", self.min_sensitivity)
+            self.max_sensitivity = checkpoint.get("max_sensitivity", self.max_sensitivity)
+            self.sensitivity_step = checkpoint.get("sensitivity_step", self.sensitivity_step)
+            
+            # Load network states
+            if "feature_extractor_state" in checkpoint:
+                self.feature_extractor.load_state_dict(checkpoint["feature_extractor_state"])
+            
+            if "policy_network_state" in checkpoint:
+                self.policy_network.load_state_dict(checkpoint["policy_network_state"])
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to load agent-specific state: {e}")
+            return False
+    
+    def _reset_agent(self):
+        """
+        Reset agent-specific episode state.
+        """
+        # Reset boundary sensitivity to initial value
+        self.boundary_sensitivity = 0.5
+        
+        # Clear any cached data
+        self.observation_history = []
+        self.action_history = []
+        self.reward_history = []

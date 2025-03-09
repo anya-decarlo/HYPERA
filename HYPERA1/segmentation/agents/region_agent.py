@@ -1,19 +1,20 @@
 #!/usr/bin/env python
-# Region Agent - Focuses on regional overlap (Dice score)
+# Region Agent - Focuses on optimizing regional overlap (Dice score)
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
+from typing import Dict, List, Tuple, Any, Optional, Union
 
-# Import base agent class
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from base_segmentation_agent import BaseSegmentationAgent
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.base_segmentation_agent import BaseSegmentationAgent
 
 class RegionAgent(BaseSegmentationAgent):
     """
@@ -41,13 +42,14 @@ class RegionAgent(BaseSegmentationAgent):
         action_dim: int = 5,  # Number of segmentation parameters to control
         action_space: Tuple[float, float] = (-1.0, 1.0),
         hidden_dim: int = 256,
-        buffer_size: int = 10000,
+        replay_buffer_size: int = 10000,
         batch_size: int = 64,
         gamma: float = 0.99,
         tau: float = 0.005,
         alpha: float = 0.2,
-        learning_rate: float = 1e-4,
+        lr: float = 3e-4,
         automatic_entropy_tuning: bool = True,
+        update_frequency: int = 1,
         log_dir: str = "logs",
         verbose: bool = False
     ):
@@ -59,212 +61,242 @@ class RegionAgent(BaseSegmentationAgent):
             device: Device to use for computation
             feature_channels: Number of channels in feature extractor
             hidden_channels: Number of channels in hidden layers
-            state_dim: Dimension of state space
+            state_dim: Dimension of state representation
             action_dim: Dimension of action space
             action_space: Tuple of (min_action, max_action)
-            hidden_dim: Dimension of hidden layers in SAC networks
-            buffer_size: Size of the replay buffer
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
             batch_size: Batch size for training
             gamma: Discount factor for future rewards
             tau: Target network update rate
             alpha: Temperature parameter for entropy
-            learning_rate: Learning rate for optimizer
+            lr: Learning rate
             automatic_entropy_tuning: Whether to automatically tune entropy
+            update_frequency: Frequency of agent updates
             log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
-        # Initialize feature extractor parameters
+        # Store additional parameters before calling super().__init__
         self.feature_channels = feature_channels
         self.hidden_channels = hidden_channels
         
-        # Call parent constructor with SAC parameters
         super().__init__(
-            name="region",
+            name="RegionAgent",
             state_manager=state_manager,
             device=device,
             state_dim=state_dim,
             action_dim=action_dim,
             action_space=action_space,
             hidden_dim=hidden_dim,
-            replay_buffer_size=buffer_size,
+            replay_buffer_size=replay_buffer_size,
             batch_size=batch_size,
             gamma=gamma,
             tau=tau,
             alpha=alpha,
-            lr=learning_rate,
+            lr=lr,
             automatic_entropy_tuning=automatic_entropy_tuning,
+            update_frequency=update_frequency,
             log_dir=log_dir,
             verbose=verbose
         )
-    
+        
+        # Initialize agent-specific components
+        self._initialize_agent()
+        
+        if self.verbose:
+            self.logger.info("Initialized RegionAgent")
+            
     def _initialize_agent(self):
-        """Initialize agent-specific parameters and networks."""
-        # Initialize feature extractor (U-Net-like encoder)
+        """
+        Initialize the agent's networks and components.
+        """
+        # Feature extractor for region features
         self.feature_extractor = nn.Sequential(
-            # Input: [B, C, H, W, D]
-            nn.Conv3d(1, self.feature_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(self.feature_channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=2, stride=2),  # [B, feature_channels, H/2, W/2, D/2]
-            
-            nn.Conv3d(self.feature_channels, self.feature_channels * 2, kernel_size=3, padding=1),
-            nn.BatchNorm3d(self.feature_channels * 2),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=2, stride=2),  # [B, feature_channels*2, H/4, W/4, D/4]
-            
-            nn.Conv3d(self.feature_channels * 2, self.feature_channels * 4, kernel_size=3, padding=1),
-            nn.BatchNorm3d(self.feature_channels * 4),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(1, self.feature_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(self.feature_channels, self.hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(self.hidden_channels, self.hidden_channels * 2, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((8, 8))
         ).to(self.device)
         
-        # Initialize state encoder (converts extracted features to state representation)
-        self.state_encoder = nn.Sequential(
-            nn.AdaptiveAvgPool3d((4, 4, 4)),  # Adaptive pooling to fixed size
-            nn.Flatten(),  # Flatten to 1D
-            nn.Linear(self.feature_channels * 4 * 4 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Linear(512, self.state_dim)
-        ).to(self.device)
-        
-        # Initialize action decoder (converts actions to segmentation parameters)
-        self.action_decoder = nn.Sequential(
-            nn.Linear(self.action_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.Tanh()  # Output normalized parameters
-        ).to(self.device)
-        
-        # Initialize optimizer for feature extractor and state encoder
-        self.optimizer = torch.optim.Adam(
-            list(self.feature_extractor.parameters()) + 
-            list(self.state_encoder.parameters()) + 
-            list(self.action_decoder.parameters()),
-            lr=self.lr
-        )
-    
-    def get_state_representation(self, observation: torch.Tensor) -> np.ndarray:
-        """
-        Extract a state representation from the observation.
-        
-        Args:
-            observation: The current observation (image or feature map)
+        if self.verbose:
+            self.logger.info("Initialized RegionAgent components")
             
-        Returns:
-            State representation as a numpy array
-        """
-        # Ensure observation is on the correct device
-        observation = observation.to(self.device)
-        
-        # Extract features using the feature extractor
-        with torch.no_grad():
-            features = self.feature_extractor(observation)
-            state = self.state_encoder(features)
-        
-        # Convert to numpy array
-        return state.cpu().numpy()
-    
-    def _extract_features(self, observation: torch.Tensor) -> Dict[str, Any]:
+    def _extract_features(self, observation):
         """
         Extract features from the observation.
         
         Args:
-            observation: The current observation
+            observation: Dictionary containing observation data
             
         Returns:
-            Dictionary of extracted features
+            Extracted features
         """
-        # Ensure observation is on the correct device
-        observation = observation.to(self.device)
+        # Extract image and prediction from observation
+        current_image = observation.get("current_image")
+        current_prediction = observation.get("current_prediction")
+        current_mask = observation.get("current_mask")
         
-        # Extract features using the feature extractor
-        with torch.no_grad():
-            features = self.feature_extractor(observation)
+        if current_image is None or current_prediction is None:
+            # Return zero features if data is missing
+            return torch.zeros((1, self.state_dim), device=self.device)
         
-        # Process features for region-specific information
-        # For example, calculate regional statistics
-        with torch.no_grad():
-            # Calculate mean and variance of features
-            mean_features = torch.mean(features, dim=(2, 3, 4))
-            var_features = torch.var(features, dim=(2, 3, 4))
-            
-            # Calculate spatial distribution
-            spatial_distribution = torch.mean(features, dim=1)
+        # Ensure tensors are on the correct device
+        current_image = current_image.to(self.device)
+        current_prediction = current_prediction.to(self.device)
         
-        return {
-            "features": features,
-            "mean_features": mean_features,
-            "var_features": var_features,
-            "spatial_distribution": spatial_distribution
-        }
+        if current_mask is not None:
+            current_mask = current_mask.to(self.device)
+        
+        # Use prediction as input to feature extractor
+        if current_prediction.dim() == 3:
+            # Add channel dimension if needed
+            current_prediction = current_prediction.unsqueeze(1)
+        elif current_prediction.dim() == 4:
+            # Use first channel if multiple channels
+            current_prediction = current_prediction[:, 0:1]
+        
+        # Extract features
+        visual_features = self.feature_extractor(current_prediction)
+        visual_features = visual_features.view(-1, self.hidden_channels * 2 * 8 * 8)
+        
+        # Project to state dimension
+        state_features = torch.nn.functional.linear(
+            visual_features, 
+            torch.randn(self.state_dim, self.hidden_channels * 2 * 8 * 8, device=self.device)
+        )
+        
+        return state_features
     
-    def apply_action(self, action: np.ndarray, features: Dict[str, Any]) -> torch.Tensor:
+    def get_state_representation(self, observation):
         """
-        Apply the action to produce a segmentation decision.
+        Get state representation from observation.
         
         Args:
-            action: Action from the SAC policy
-            features: Dictionary of extracted features
+            observation: Dictionary containing observation data
             
         Returns:
-            Segmentation decision tensor
+            State representation
         """
-        # Convert action to tensor
-        action_tensor = torch.FloatTensor(action).to(self.device)
+        # Extract features from observation
+        features = self._extract_features(observation)
         
-        # Decode action into segmentation parameters
-        segmentation_params = self.action_decoder(action_tensor)
+        # Return features as state representation
+        return features
+    
+    def apply_action(self, action):
+        """
+        Apply action to modify segmentation.
         
-        # Apply segmentation parameters to features
-        # This is a simplified example - actual implementation would depend on
-        # how segmentation parameters affect the segmentation process
-        raw_features = features["features"]
-        batch_size = raw_features.shape[0]
+        Args:
+            action: Action to apply
+            
+        Returns:
+            Modified segmentation
+        """
+        # Get current prediction from state manager
+        current_prediction = self.state_manager.get_current_prediction()
         
-        # Example: Use parameters to adjust thresholds, weights, etc.
-        # In a real implementation, these would control specific aspects of segmentation
-        threshold = 0.5 + 0.3 * segmentation_params[0].item()  # Adjust threshold
+        if current_prediction is None:
+            # Return None if no prediction is available
+            return None
         
-        # Apply threshold to features to get segmentation mask
-        # This is a simplified example
-        segmentation_mask = torch.sigmoid(raw_features[:, 0:1, :, :, :]) > threshold
+        # Ensure tensor is on the correct device
+        current_prediction = current_prediction.to(self.device)
         
-        return segmentation_mask.float()
+        # For RegionAgent, we interpret the action as parameters for morphological operations
+        # and refinement of the segmentation
+        
+        # Apply action to modify segmentation
+        # This is a simplified implementation - in practice, you would use the action
+        # to control parameters of more sophisticated segmentation refinement operations
+        
+        # Handle different action types
+        if isinstance(action, torch.Tensor):
+            if action.numel() == 1:
+                action_value = action.item()
+            else:
+                # If multi-dimensional tensor, take the first element
+                action_value = action[0].item() if action.numel() > 0 else 0.0
+        elif isinstance(action, np.ndarray):
+            if action.size == 1:
+                action_value = float(action[0])
+            else:
+                # If multi-dimensional array, take the first element
+                action_value = float(action.flat[0]) if action.size > 0 else 0.0
+        else:
+            # Assume it's a scalar
+            action_value = float(action)
+            
+        # Map action to threshold in [0.2, 0.8]
+        threshold = 0.5 + 0.3 * action_value
+        
+        # Apply threshold to create binary segmentation
+        binary_prediction = (current_prediction > threshold).float()
+        
+        # Update prediction in state manager
+        self.state_manager.set_current_prediction(binary_prediction)
+        
+        return binary_prediction
     
     def _save_agent_state(self, save_dict: Dict[str, Any]):
         """
         Add agent-specific state to the save dictionary.
         
         Args:
-            save_dict: Dictionary to add agent-specific state to
+            save_dict: Dictionary to add agent state to
         """
-        save_dict["feature_extractor"] = self.feature_extractor.state_dict()
-        save_dict["state_encoder"] = self.state_encoder.state_dict()
-        save_dict["action_decoder"] = self.action_decoder.state_dict()
-        save_dict["optimizer"] = self.optimizer.state_dict()
+        # Add agent-specific parameters to save_dict
+        save_dict.update({
+            'feature_channels': self.feature_channels,
+            'hidden_channels': self.hidden_channels,
+            'feature_extractor_state': self.feature_extractor.state_dict() if self.feature_extractor else None,
+        })
     
-    def _load_agent_state(self, checkpoint: Dict[str, Any]) -> bool:
+    def _load_agent_state(self, path):
         """
-        Load agent-specific state from the checkpoint.
+        Load agent state from file.
         
         Args:
-            checkpoint: Dictionary containing the agent state
-            
-        Returns:
-            Whether the load was successful
+            path: Path to load agent state from
         """
-        try:
-            self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
-            self.state_encoder.load_state_dict(checkpoint["state_encoder"])
-            self.action_decoder.load_state_dict(checkpoint["action_decoder"])
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to load agent-specific state: {e}")
-            return False
+        # Load state dict from file
+        state_dict = torch.load(path)
+        
+        # Load agent-specific parameters
+        if 'feature_channels' in state_dict:
+            self.feature_channels = state_dict['feature_channels']
+        
+        if 'hidden_channels' in state_dict:
+            self.hidden_channels = state_dict['hidden_channels']
+            
+        # Load feature extractor state
+        if 'feature_extractor_state' in state_dict and state_dict['feature_extractor_state'] and self.feature_extractor:
+            self.feature_extractor.load_state_dict(state_dict['feature_extractor_state'])
+            
+        # Load SAC model separately
+        sac_path = os.path.join(os.path.dirname(path), f"{self.name}_sac")
+        if os.path.exists(f"{sac_path}_critic.pth"):
+            self.sac.load_models(sac_path)
+            
+        if self.verbose:
+            self.logger.info(f"Loaded RegionAgent state from {path}")
     
     def _reset_agent(self):
-        """Reset agent-specific episode state."""
-        # No episode-specific state to reset for this agent
-        pass
+        """
+        Reset the agent to its initial state.
+        """
+        # Reset history
+        self.action_history = []
+        self.reward_history = []
+        self.observation_history = []
+        
+        # Re-initialize networks
+        self._initialize_agent()
+        
+        if self.verbose:
+            self.logger.info("Reset RegionAgent to initial state")

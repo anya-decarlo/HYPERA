@@ -207,6 +207,70 @@ class SegmentationStateManager:
         """
         self.current_prediction = prediction
     
+    def update_segmentation(self, segmentation: torch.Tensor):
+        """
+        Update the current segmentation prediction.
+        
+        Args:
+            segmentation: Updated segmentation tensor
+        """
+        self.current_prediction = segmentation
+        
+        if self.verbose:
+            self.logger.debug(f"Updated segmentation with shape {segmentation.shape}")
+    
+    def update_current_image(self, image: torch.Tensor):
+        """
+        Update the current image being processed.
+        
+        Args:
+            image: Updated image tensor
+        """
+        self.current_image = image
+        
+        if self.verbose:
+            self.logger.debug(f"Updated current image with shape {image.shape}")
+    
+    def update_current_mask(self, mask: torch.Tensor):
+        """
+        Update the current ground truth mask.
+        
+        Args:
+            mask: Updated ground truth mask tensor
+        """
+        self.current_ground_truth = mask
+        
+        if self.verbose:
+            self.logger.debug(f"Updated ground truth mask with shape {mask.shape}")
+    
+    def update_state(self, inputs: torch.Tensor, targets: torch.Tensor, initial_preds: torch.Tensor, batch_idx: int, epoch: int, is_validation: bool = False):
+        """
+        Update the state with a new batch of data.
+        
+        Args:
+            inputs: Input images
+            targets: Target segmentations
+            initial_preds: Initial predictions from the model
+            batch_idx: Batch index
+            epoch: Current epoch
+            is_validation: Whether this is a validation batch
+        """
+        # Update epoch if needed
+        if self.current_epoch != epoch:
+            self.update_epoch(epoch)
+        
+        # Update images and segmentations
+        self.update_current_image(inputs)
+        self.update_current_mask(targets)
+        self.update_segmentation(initial_preds)
+        
+        # Store batch information
+        self.set_feature("batch_idx", batch_idx)
+        self.set_feature("is_validation", is_validation)
+        
+        if self.verbose:
+            self.logger.debug(f"Updated state with batch {batch_idx}, epoch {epoch}")
+    
     def set_feature(self, key: str, feature: Any):
         """
         Set a feature in the current feature dictionary.
@@ -228,6 +292,33 @@ class SegmentationStateManager:
             Feature value or None if not available
         """
         return self.current_features.get(key, None)
+    
+    def get_current_image(self) -> Optional[torch.Tensor]:
+        """
+        Get the current image being processed.
+        
+        Returns:
+            Current image tensor or None if not set
+        """
+        return self.current_image
+    
+    def get_current_ground_truth(self) -> Optional[torch.Tensor]:
+        """
+        Get the current ground truth segmentation.
+        
+        Returns:
+            Current ground truth segmentation tensor or None if not set
+        """
+        return self.current_ground_truth
+    
+    def get_current_prediction(self) -> Optional[torch.Tensor]:
+        """
+        Get the current prediction segmentation.
+        
+        Returns:
+            Current prediction segmentation tensor or None if not set
+        """
+        return self.current_prediction
     
     def get_state_dict(self) -> Dict[str, Any]:
         """

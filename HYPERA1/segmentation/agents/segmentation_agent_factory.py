@@ -2,16 +2,20 @@
 # Segmentation Agent Factory - Creates and manages segmentation agents
 
 import os
+import sys
 import torch
 from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 
-from .region_agent import RegionAgent
-from .boundary_agent import BoundaryAgent
-from .shape_agent import ShapeAgent
-from .fg_balance_agent import FGBalanceAgent
-from .object_detection_agent import ObjectDetectionAgent
-from ..segmentation_state_manager import SegmentationStateManager
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.agents.region_agent import RegionAgent
+from HYPERA1.segmentation.agents.boundary_agent import BoundaryAgent
+from HYPERA1.segmentation.agents.shape_agent import ShapeAgent
+from HYPERA1.segmentation.agents.fg_balance_agent import FGBalanceAgent
+from HYPERA1.segmentation.agents.object_detection_agent import ObjectDetectionAgent
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
 
 class SegmentationAgentFactory:
     """
@@ -58,17 +62,37 @@ class SegmentationAgentFactory:
     
     def create_region_agent(
         self,
-        learning_rate: float = 0.001,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        update_frequency: int = 1
+        update_frequency: int = 1,
+        state_dim: int = 128,
+        action_dim: int = 5,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        automatic_entropy_tuning: bool = True,
+        log_dir: str = "logs"
     ) -> RegionAgent:
         """
         Create a region agent.
         
         Args:
-            learning_rate: Learning rate for optimizer
+            lr: Learning rate
             gamma: Discount factor for future rewards
             update_frequency: Frequency of agent updates
+            state_dim: Dimension of state representation
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            log_dir: Directory for saving logs and checkpoints
             
         Returns:
             Initialized region agent
@@ -76,30 +100,60 @@ class SegmentationAgentFactory:
         agent = RegionAgent(
             state_manager=self.state_manager,
             device=self.device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=self.verbose
         )
         
         if self.verbose:
-            self.logger.info(f"Created RegionAgent with learning_rate={learning_rate}, gamma={gamma}, update_frequency={update_frequency}")
+            self.logger.info(f"Created RegionAgent with lr={lr}, gamma={gamma}, update_frequency={update_frequency}")
         
         return agent
     
     def create_boundary_agent(
         self,
-        learning_rate: float = 0.001,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        update_frequency: int = 3
-    ) -> BoundaryAgent:
+        update_frequency: int = 3,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        automatic_entropy_tuning: bool = True,
+        log_dir: str = "logs"
+    ):
         """
         Create a boundary agent.
         
         Args:
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
+            lr: Learning rate
+            gamma: Discount factor
             update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            log_dir: Directory for saving logs and checkpoints
             
         Returns:
             Initialized boundary agent
@@ -107,30 +161,60 @@ class SegmentationAgentFactory:
         agent = BoundaryAgent(
             state_manager=self.state_manager,
             device=self.device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=self.verbose
         )
         
         if self.verbose:
-            self.logger.info(f"Created BoundaryAgent with learning_rate={learning_rate}, gamma={gamma}, update_frequency={update_frequency}")
+            self.logger.info(f"Created BoundaryAgent with lr={lr}, gamma={gamma}, update_frequency={update_frequency}")
         
         return agent
     
     def create_shape_agent(
         self,
-        learning_rate: float = 0.001,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        update_frequency: int = 5
+        update_frequency: int = 5,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        automatic_entropy_tuning: bool = True,
+        log_dir: str = "logs"
     ) -> ShapeAgent:
         """
         Create a shape agent.
         
         Args:
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
+            lr: Learning rate
+            gamma: Discount factor
             update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            log_dir: Directory for saving logs and checkpoints
             
         Returns:
             Initialized shape agent
@@ -138,30 +222,60 @@ class SegmentationAgentFactory:
         agent = ShapeAgent(
             state_manager=self.state_manager,
             device=self.device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=self.verbose
         )
         
         if self.verbose:
-            self.logger.info(f"Created ShapeAgent with learning_rate={learning_rate}, gamma={gamma}, update_frequency={update_frequency}")
+            self.logger.info(f"Created ShapeAgent with lr={lr}, gamma={gamma}, update_frequency={update_frequency}")
         
         return agent
     
     def create_fg_balance_agent(
         self,
-        learning_rate: float = 0.001,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        update_frequency: int = 2
+        update_frequency: int = 2,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        automatic_entropy_tuning: bool = True,
+        log_dir: str = "logs"
     ) -> FGBalanceAgent:
         """
         Create a foreground-background balance agent.
         
         Args:
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
+            lr: Learning rate
+            gamma: Discount factor
             update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            log_dir: Directory for saving logs and checkpoints
             
         Returns:
             Initialized foreground-background balance agent
@@ -169,30 +283,60 @@ class SegmentationAgentFactory:
         agent = FGBalanceAgent(
             state_manager=self.state_manager,
             device=self.device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=self.verbose
         )
         
         if self.verbose:
-            self.logger.info(f"Created FGBalanceAgent with learning_rate={learning_rate}, gamma={gamma}, update_frequency={update_frequency}")
+            self.logger.info(f"Created FGBalanceAgent with lr={lr}, gamma={gamma}, update_frequency={update_frequency}")
         
         return agent
     
     def create_object_detection_agent(
         self,
-        learning_rate: float = 0.001,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        update_frequency: int = 1
+        update_frequency: int = 1,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        automatic_entropy_tuning: bool = True,
+        log_dir: str = "logs"
     ) -> ObjectDetectionAgent:
         """
         Create an object detection agent.
         
         Args:
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
+            lr: Learning rate
+            gamma: Discount factor
             update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            log_dir: Directory for saving logs and checkpoints
             
         Returns:
             Initialized object detection agent
@@ -200,14 +344,24 @@ class SegmentationAgentFactory:
         agent = ObjectDetectionAgent(
             state_manager=self.state_manager,
             device=self.device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=self.verbose
         )
         
         if self.verbose:
-            self.logger.info(f"Created ObjectDetectionAgent with learning_rate={learning_rate}, gamma={gamma}, update_frequency={update_frequency}")
+            self.logger.info(f"Created ObjectDetectionAgent with lr={lr}, gamma={gamma}, update_frequency={update_frequency}")
         
         return agent
     
@@ -253,22 +407,37 @@ class SegmentationAgentFactory:
         
         # Create region agent if in config
         if "region" in config:
+            # Convert learning_rate to lr if present
+            if "learning_rate" in config["region"]:
+                config["region"]["lr"] = config["region"].pop("learning_rate")
             agents["region"] = self.create_region_agent(**config["region"])
         
         # Create boundary agent if in config
         if "boundary" in config:
+            # Convert learning_rate to lr if present
+            if "learning_rate" in config["boundary"]:
+                config["boundary"]["lr"] = config["boundary"].pop("learning_rate")
             agents["boundary"] = self.create_boundary_agent(**config["boundary"])
         
         # Create shape agent if in config
         if "shape" in config:
+            # Convert learning_rate to lr if present
+            if "learning_rate" in config["shape"]:
+                config["shape"]["lr"] = config["shape"].pop("learning_rate")
             agents["shape"] = self.create_shape_agent(**config["shape"])
         
         # Create foreground-background balance agent if in config
         if "fg_balance" in config:
+            # Convert learning_rate to lr if present
+            if "learning_rate" in config["fg_balance"]:
+                config["fg_balance"]["lr"] = config["fg_balance"].pop("learning_rate")
             agents["fg_balance"] = self.create_fg_balance_agent(**config["fg_balance"])
         
         # Create object detection agent if in config
         if "object_detection" in config:
+            # Convert learning_rate to lr if present
+            if "learning_rate" in config["object_detection"]:
+                config["object_detection"]["lr"] = config["object_detection"].pop("learning_rate")
             agents["object_detection"] = self.create_object_detection_agent(**config["object_detection"])
         
         if self.verbose:

@@ -2,6 +2,7 @@
 # Base Segmentation Agent - Foundation for all segmentation agents
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,8 +12,11 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
 
-from .utils.sac.sac import SAC
-from .utils.replay_buffer import ReplayBuffer
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from HYPERA1.segmentation.utils.sac.sac import SAC
+from HYPERA1.segmentation.utils.replay_buffer import ReplayBuffer
 
 class BaseSegmentationAgent(ABC):
     """
@@ -53,6 +57,7 @@ class BaseSegmentationAgent(ABC):
         alpha: float = 0.2,
         lr: float = 3e-4,
         automatic_entropy_tuning: bool = True,
+        update_frequency: int = 1,
         log_dir: str = "logs",
         verbose: bool = False
     ):
@@ -74,6 +79,7 @@ class BaseSegmentationAgent(ABC):
             alpha: Temperature parameter for entropy
             lr: Learning rate
             automatic_entropy_tuning: Whether to automatically tune entropy
+            update_frequency: How often the agent should update (in steps)
             log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
@@ -90,6 +96,7 @@ class BaseSegmentationAgent(ABC):
         self.alpha = alpha
         self.lr = lr
         self.automatic_entropy_tuning = automatic_entropy_tuning
+        self.update_frequency = update_frequency
         self.log_dir = log_dir
         self.verbose = verbose
         
@@ -252,8 +259,14 @@ class BaseSegmentationAgent(ABC):
             done
         )
         
-        # Update SAC parameters
-        metrics = self.sac.update_parameters()
+        # Increment training step
+        self.training_step += 1
+        
+        # Only update parameters based on update frequency
+        metrics = {"loss": 0.0}
+        if self.training_step % self.update_frequency == 0:
+            # Update SAC parameters
+            metrics = self.sac.update_parameters()
         
         # Update last state
         self.last_state = self.current_state
@@ -432,3 +445,41 @@ class BaseSegmentationAgent(ABC):
         Must be implemented by each specialized agent.
         """
         pass
+    
+    def get_last_actions(self):
+        """
+        Get the last actions taken by the agent.
+        
+        Returns:
+            Dictionary of action names and values
+        """
+        if self.last_action is None:
+            return {}
+            
+        # Convert tensor to float if needed
+        if isinstance(self.last_action, torch.Tensor):
+            if self.last_action.numel() == 1:
+                action_value = self.last_action.item()
+            else:
+                action_value = self.last_action[0].item() if self.last_action.numel() > 0 else 0.0
+        elif isinstance(self.last_action, np.ndarray):
+            if self.last_action.size == 1:
+                action_value = float(self.last_action[0])
+            else:
+                action_value = float(self.last_action.flat[0]) if self.last_action.size > 0 else 0.0
+        else:
+            action_value = float(self.last_action)
+            
+        return {'segmentation_refinement': action_value}
+    
+    def get_last_reward_info(self):
+        """
+        Get information about the last reward.
+        
+        Returns:
+            Dictionary with reward components
+        """
+        if not hasattr(self, 'last_reward_info') or self.last_reward_info is None:
+            return {'total': 0.0, 'dice_improvement': 0.0, 'boundary_improvement': 0.0, 'efficiency': 0.0}
+            
+        return self.last_reward_info

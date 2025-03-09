@@ -25,10 +25,12 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         initial_lambda_ce: float = 1.0,
         initial_lambda_dice: float = 1.0,
         initial_focal_gamma: float = 2.0,
-        min_lambda: float = 0.1,
-        max_lambda: float = 5.0,
-        min_gamma: float = 0.5,
-        max_gamma: float = 4.0,
+        min_lambda_ce: float = 0.1,
+        max_lambda_ce: float = 5.0,
+        min_lambda_dice: float = 0.1,
+        max_lambda_dice: float = 5.0,
+        min_focal_gamma: float = 0.5,
+        max_focal_gamma: float = 4.0,
         update_frequency: int = 15,  # Less frequent updates
         patience: int = 7,
         cooldown: int = 20,
@@ -42,60 +44,95 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         n_step: int = 3,
         stability_weight: float = 0.3,
         generalization_weight: float = 0.4,
-        efficiency_weight: float = 0.3
+        efficiency_weight: float = 0.3,
+        use_adaptive_scaling: bool = True,
+        use_phase_aware_scaling: bool = True,
+        auto_balance_components: bool = True,
+        reward_clip_range: Optional[Tuple[float, float]] = None,
+        reward_scaling_window: int = 100,
+        device: Optional[torch.device] = None,
+        name: str = "loss_function_agent",
+        priority: int = 0
     ):
         """
         Initialize the loss function agent.
         
         Args:
-            shared_state_manager: Manager for shared state across agents
+            shared_state_manager: Manager for shared state between agents
             initial_lambda_ce: Initial weight for cross-entropy loss
             initial_lambda_dice: Initial weight for dice loss
             initial_focal_gamma: Initial gamma parameter for focal loss
-            min_lambda: Minimum allowed lambda value
-            max_lambda: Maximum allowed lambda value
-            min_gamma: Minimum allowed gamma value
-            max_gamma: Maximum allowed gamma value
-            update_frequency: How often to consider updates (in epochs)
+            min_lambda_ce: Minimum allowed lambda_ce value
+            max_lambda_ce: Maximum allowed lambda_ce value
+            min_lambda_dice: Minimum allowed lambda_dice value
+            max_lambda_dice: Maximum allowed lambda_dice value
+            min_focal_gamma: Minimum allowed focal_gamma value
+            max_focal_gamma: Maximum allowed focal_gamma value
+            update_frequency: How often to update loss function parameters (in epochs)
             patience: Epochs to wait before considering action
             cooldown: Epochs to wait after an action
-            log_dir: Directory for saving logs
+            log_dir: Directory for saving logs and agent states
             verbose: Whether to print verbose output
-            metrics_to_track: List of metrics to include in state representation
-            state_dim: Dimension of state representation
-            hidden_dim: Hidden dimension for SAC networks
+            metrics_to_track: List of metrics to track
+            state_dim: Dimension of state space
+            hidden_dim: Dimension of hidden layers
             use_enhanced_state: Whether to use enhanced state representation
-            eligibility_trace_length: Length of eligibility traces for reward calculation
+            eligibility_trace_length: Length of eligibility traces
             n_step: Number of steps for n-step returns
-            stability_weight: Weight for stability component in reward
-            generalization_weight: Weight for generalization component in reward
-            efficiency_weight: Weight for efficiency component in reward
+            stability_weight: Weight for stability component of reward
+            generalization_weight: Weight for generalization component of reward
+            efficiency_weight: Weight for efficiency component of reward
+            use_adaptive_scaling: Whether to use adaptive reward scaling
+            use_phase_aware_scaling: Whether to use phase-aware scaling
+            auto_balance_components: Whether to auto-balance reward components
+            reward_clip_range: Range for clipping rewards
+            reward_scaling_window: Window size for reward statistics
+            device: Device to use for training
+            name: Name of agent
+            priority: Priority of the agent (higher means more important)
         """
+        # Set default device if not provided
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        # Set default reward clip range if not provided
+        if reward_clip_range is None:
+            reward_clip_range = (-10.0, 10.0)
+            
         super().__init__(
-            name="loss_function",
+            name=name,
             hyperparameter_key="loss_params",
             shared_state_manager=shared_state_manager,
             state_dim=state_dim,
             action_dim=3,  # lambda_ce, lambda_dice, focal_gamma
-            action_space=(-1.0, 1.0),  # Normalized action space
+            action_space=(-1.0, 1.0),
             hidden_dim=hidden_dim,
             update_frequency=update_frequency,
             patience=patience,
             cooldown=cooldown,
             log_dir=log_dir,
             verbose=verbose,
+            device=device,
             eligibility_trace_length=eligibility_trace_length,
             n_step=n_step,
             stability_weight=stability_weight,
             generalization_weight=generalization_weight,
-            efficiency_weight=efficiency_weight
+            efficiency_weight=efficiency_weight,
+            use_adaptive_scaling=use_adaptive_scaling,
+            use_phase_aware_scaling=use_phase_aware_scaling,
+            auto_balance_components=auto_balance_components,
+            reward_clip_range=reward_clip_range,
+            reward_scaling_window=reward_scaling_window,
+            priority=priority
         )
         
         # Loss function specific parameters
-        self.min_lambda = min_lambda
-        self.max_lambda = max_lambda
-        self.min_gamma = min_gamma
-        self.max_gamma = max_gamma
+        self.min_lambda_ce = min_lambda_ce
+        self.max_lambda_ce = max_lambda_ce
+        self.min_lambda_dice = min_lambda_dice
+        self.max_lambda_dice = max_lambda_dice
+        self.min_focal_gamma = min_focal_gamma
+        self.max_focal_gamma = max_focal_gamma
         self.metrics_to_track = metrics_to_track
         self.use_enhanced_state = use_enhanced_state
         
@@ -105,10 +142,13 @@ class LossFunctionAgent(BaseHyperparameterAgent):
             "lambda_dice": initial_lambda_dice,
             "focal_gamma": initial_focal_gamma
         }
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_params)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_params)
+        
+        # Add epochs_since_update attribute
+        self.epochs_since_update = 0
         
         # Log initialization
-        self.log(f"Initialized with loss_params={self.current_params}")
+        logging.info(f"Initialized with loss_params={self.current_params}")
     
     def get_state_representation(self) -> np.ndarray:
         """
@@ -142,13 +182,13 @@ class LossFunctionAgent(BaseHyperparameterAgent):
                     state_components.extend(list(overfitting_signals.values()))
                 
                 # Add normalized current loss parameters
-                normalized_lambda_ce = (self.current_params["lambda_ce"] - self.min_lambda) / (self.max_lambda - self.min_lambda)
+                normalized_lambda_ce = (self.current_params["lambda_ce"] - self.min_lambda_ce) / (self.max_lambda_ce - self.min_lambda_ce)
                 state_components.append(normalized_lambda_ce)
                 
-                normalized_lambda_dice = (self.current_params["lambda_dice"] - self.min_lambda) / (self.max_lambda - self.min_lambda)
+                normalized_lambda_dice = (self.current_params["lambda_dice"] - self.min_lambda_dice) / (self.max_lambda_dice - self.min_lambda_dice)
                 state_components.append(normalized_lambda_dice)
                 
-                normalized_gamma = (self.current_params["focal_gamma"] - self.min_gamma) / (self.max_gamma - self.min_gamma)
+                normalized_gamma = (self.current_params["focal_gamma"] - self.min_focal_gamma) / (self.max_focal_gamma - self.min_focal_gamma)
                 state_components.append(normalized_gamma)
                 
                 # Add component-wise loss ratio if available
@@ -211,13 +251,13 @@ class LossFunctionAgent(BaseHyperparameterAgent):
                 state_components.extend([0.0, 0.0])
         
         # Add normalized current loss parameters
-        normalized_lambda_ce = (self.current_params["lambda_ce"] - self.min_lambda) / (self.max_lambda - self.min_lambda)
+        normalized_lambda_ce = (self.current_params["lambda_ce"] - self.min_lambda_ce) / (self.max_lambda_ce - self.min_lambda_ce)
         state_components.append(normalized_lambda_ce)
         
-        normalized_lambda_dice = (self.current_params["lambda_dice"] - self.min_lambda) / (self.max_lambda - self.min_lambda)
+        normalized_lambda_dice = (self.current_params["lambda_dice"] - self.min_lambda_dice) / (self.max_lambda_dice - self.min_lambda_dice)
         state_components.append(normalized_lambda_dice)
         
-        normalized_gamma = (self.current_params["focal_gamma"] - self.min_gamma) / (self.max_gamma - self.min_gamma)
+        normalized_gamma = (self.current_params["focal_gamma"] - self.min_focal_gamma) / (self.max_focal_gamma - self.min_focal_gamma)
         state_components.append(normalized_gamma)
         
         # Add component-wise loss ratio if available
@@ -253,7 +293,7 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         
         return state
     
-    def action_to_hyperparameter(self, action: np.ndarray) -> Dict[str, float]:
+    def action_to_hyperparameter(self, action):
         """
         Convert normalized actions to actual loss function parameters.
         
@@ -264,29 +304,36 @@ class LossFunctionAgent(BaseHyperparameterAgent):
             Dictionary of new loss function parameters
         """
         new_params = {}
-        action_idx = 0
+        
+        # Handle both scalar and array/list actions
+        if not isinstance(action, (list, np.ndarray)):
+            # If action is a scalar, use default values with small adjustments
+            factor_ce = 1.0
+            factor_dice = 1.0
+            factor_gamma = 1.0
+        else:
+            # If action is an array/list, use the values
+            factor_ce = 2.0 ** action[0] if len(action) > 0 else 1.0
+            factor_dice = 2.0 ** action[1] if len(action) > 1 else 1.0
+            factor_gamma = 2.0 ** action[2] if len(action) > 2 else 1.0
         
         # Convert actions based on loss type
-        factor_ce = 2.0 ** action[action_idx]
         new_lambda_ce = self.current_params["lambda_ce"] * factor_ce
-        new_lambda_ce = np.clip(new_lambda_ce, self.min_lambda, self.max_lambda)
+        new_lambda_ce = np.clip(new_lambda_ce, self.min_lambda_ce, self.max_lambda_ce)
         new_params["lambda_ce"] = new_lambda_ce
-        action_idx += 1
         
-        factor_dice = 2.0 ** action[action_idx]
         new_lambda_dice = self.current_params["lambda_dice"] * factor_dice
-        new_lambda_dice = np.clip(new_lambda_dice, self.min_lambda, self.max_lambda)
+        new_lambda_dice = np.clip(new_lambda_dice, self.min_lambda_dice, self.max_lambda_dice)
         new_params["lambda_dice"] = new_lambda_dice
-        action_idx += 1
         
-        factor_gamma = 1.5 ** action[action_idx]
-        new_focal_gamma = self.current_params["focal_gamma"] * factor_gamma
-        new_focal_gamma = np.clip(new_focal_gamma, self.min_gamma, self.max_gamma)
-        new_params["focal_gamma"] = new_focal_gamma
+        if "focal_gamma" in self.current_params:
+            new_focal_gamma = self.current_params["focal_gamma"] * factor_gamma
+            new_focal_gamma = np.clip(new_focal_gamma, self.min_focal_gamma, self.max_focal_gamma)
+            new_params["focal_gamma"] = new_focal_gamma
         
         return new_params
     
-    def _process_action(self, action: np.ndarray) -> Dict[str, float]:
+    def _process_action(self, action):
         """
         Process the action from SAC to get the new loss function parameters.
         
@@ -296,6 +343,7 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         Returns:
             New loss function parameters
         """
+        # Handle both scalar and array/list actions
         return self.action_to_hyperparameter(action)
     
     def _apply_action(self, new_params: Dict[str, float]) -> None:
@@ -310,10 +358,29 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         self.current_params = new_params
         
         # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_params)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_params)
         
         # Log update
-        self.log(f"Updated loss_params: {old_params} -> {self.current_params}")
+        logging.info(f"Updated loss_params: {old_params} -> {self.current_params}")
+    
+    def select_action(self, epoch: int) -> Optional[Dict[str, float]]:
+        """
+        Select an action based on the current state.
+        
+        Args:
+            epoch: Current training epoch
+            
+        Returns:
+            Action value (loss function parameters) or None if no action should be taken
+        """
+        if not self.should_update(epoch):
+            return None
+            
+        state = self.get_state_representation()
+        action = self.sac.select_action(state)
+        processed_action = self._process_action(action)
+        
+        return processed_action
     
     def _get_state_representation(self) -> np.ndarray:
         """
@@ -321,7 +388,14 @@ class LossFunctionAgent(BaseHyperparameterAgent):
         
         Returns:
             State representation as numpy array
-        """
+
         return self.get_state_representation()
-
-
+    
+    def get_current_params(self) -> Dict[str, float]:
+        """
+        Get the current loss function parameters.
+        
+        Returns:
+            Current loss function parameters
+        """
+        return self.current_params.copy()

@@ -44,7 +44,15 @@ class NormalizationAgent(BaseHyperparameterAgent):
         n_step: int = 3,
         stability_weight: float = 0.4,  # Higher stability weight for normalization
         generalization_weight: float = 0.4,
-        efficiency_weight: float = 0.2
+        efficiency_weight: float = 0.2,
+        use_adaptive_scaling: bool = True,
+        use_phase_aware_scaling: bool = True,
+        auto_balance_components: bool = True,
+        reward_clip_range: Optional[Tuple[float, float]] = None,
+        reward_scaling_window: int = 100,
+        device: Optional[torch.device] = None,
+        name: str = "normalization_agent",
+        priority: int = 0
     ):
         """
         Initialize the normalization agent.
@@ -66,6 +74,14 @@ class NormalizationAgent(BaseHyperparameterAgent):
             stability_weight: Weight for stability component in reward
             generalization_weight: Weight for generalization component in reward
             efficiency_weight: Weight for efficiency component in reward
+            use_adaptive_scaling: Whether to use adaptive scaling
+            use_phase_aware_scaling: Whether to use phase-aware scaling
+            auto_balance_components: Whether to auto-balance components
+            reward_clip_range: Range for clipping rewards
+            reward_scaling_window: Window size for reward scaling
+            device: Device for computations
+            name: Name of the agent
+            priority: Priority of the agent (higher means more important)
         """
         # Validate initial norm type
         if initial_norm_type not in self.NORM_TYPES.values():
@@ -76,7 +92,7 @@ class NormalizationAgent(BaseHyperparameterAgent):
         self.norm_type_to_idx = {norm_type: idx for idx, norm_type in self.NORM_TYPES.items()}
         
         super().__init__(
-            name="normalization",
+            name=name,
             hyperparameter_key="norm_type",
             shared_state_manager=shared_state_manager,
             state_dim=state_dim,
@@ -92,7 +108,14 @@ class NormalizationAgent(BaseHyperparameterAgent):
             n_step=n_step,
             stability_weight=stability_weight,
             generalization_weight=generalization_weight,
-            efficiency_weight=efficiency_weight
+            efficiency_weight=efficiency_weight,
+            use_adaptive_scaling=use_adaptive_scaling,
+            use_phase_aware_scaling=use_phase_aware_scaling,
+            auto_balance_components=auto_balance_components,
+            reward_clip_range=reward_clip_range,
+            reward_scaling_window=reward_scaling_window,
+            device=device,
+            priority=priority
         )
         
         # Normalization specific parameters
@@ -101,10 +124,13 @@ class NormalizationAgent(BaseHyperparameterAgent):
         
         # Initialize normalization type
         self.current_norm_type = initial_norm_type
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_norm_type)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_norm_type)
+        
+        # Add epochs_since_update attribute
+        self.epochs_since_update = 0
         
         # Log initialization
-        self.log(f"Initialized with norm_type={self.current_norm_type}")
+        logging.info(f"Initialized with norm_type={self.current_norm_type}")
     
     def get_state_representation(self) -> np.ndarray:
         """
@@ -232,7 +258,7 @@ class NormalizationAgent(BaseHyperparameterAgent):
         
         return state
     
-    def action_to_hyperparameter(self, action: float) -> str:
+    def action_to_hyperparameter(self, action):
         """
         Convert normalized action to normalization type.
         
@@ -242,9 +268,15 @@ class NormalizationAgent(BaseHyperparameterAgent):
         Returns:
             New normalization type
         """
+        # Handle both scalar and array/list actions
+        if isinstance(action, (list, np.ndarray)) and len(action) > 0:
+            action_value = action[0]
+        else:
+            action_value = action
+            
         # Map continuous action to discrete norm type index
         # Scale from [-1, 1] to [0, len(NORM_TYPES)-1]
-        scaled_action = (action + 1.0) / 2.0 * (len(self.NORM_TYPES) - 1)
+        scaled_action = (action_value + 1.0) / 2.0 * (len(self.NORM_TYPES) - 1)
         norm_idx = int(np.round(scaled_action))
         
         # Clip to valid range
@@ -282,10 +314,10 @@ class NormalizationAgent(BaseHyperparameterAgent):
         self.current_norm_type = new_norm_type
         
         # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_norm_type)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_norm_type)
         
         # Log update
-        self.log(f"Updated norm_type: {old_norm_type} -> {self.current_norm_type}")
+        logging.info(f"Updated norm_type: {old_norm_type} -> {self.current_norm_type}")
         
         # Return update info
         return {
@@ -295,3 +327,81 @@ class NormalizationAgent(BaseHyperparameterAgent):
             "hyperparameter": self.hyperparameter_key,
             "changed": True
         }
+    
+    def _get_state_representation(self) -> np.ndarray:
+        """
+        Get the state representation for the agent.
+        
+        Returns:
+            State representation as numpy array
+        """
+        return self.get_state_representation()
+        
+    def _process_action(self, action):
+        """
+        Process the continuous action from the agent to get a discrete action.
+        
+        Args:
+            action: Continuous action from the agent
+            
+        Returns:
+            Discrete action index
+        """
+        # Map continuous action to discrete action space
+        # Scale from [-1, 1] to [0, 3]
+        # Handle both scalar and array/list actions
+        if isinstance(action, (list, np.ndarray)):
+            if len(action) > 0:
+                # Ensure action[0] is a number
+                action_value = float(action[0]) if isinstance(action[0], (int, float, np.number)) else 0.0
+            else:
+                action_value = 0.0
+        else:
+            # Ensure action is a number
+            action_value = float(action) if isinstance(action, (int, float, np.number)) else 0.0
+            
+        scaled_action = (action_value + 1.0) / 2.0 * (len(self.NORM_TYPES) - 1)
+        discrete_action = int(np.round(scaled_action))
+        discrete_action = np.clip(discrete_action, 0, len(self.NORM_TYPES) - 1)
+        return discrete_action
+        
+    def _apply_action(self, new_norm_type: str) -> None:
+        """
+        Apply the new normalization type.
+        
+        Args:
+            new_norm_type: New normalization type
+        """
+        self.current_norm_type = new_norm_type
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, new_norm_type)
+        
+        if self.verbose:
+            logging.info(f"Normalization type updated to {new_norm_type}")
+    
+    def select_action(self, epoch: int) -> Optional[str]:
+        """
+        Select an action based on the current state.
+        
+        Args:
+            epoch: Current training epoch
+            
+        Returns:
+            Action value (normalization type) or None if no action should be taken
+        """
+        if not self.should_update(epoch):
+            return None
+            
+        state = self.get_state_representation()
+        action = self.sac.select_action(state)
+        processed_action = self._process_action(action)
+        
+        return self.NORM_TYPES[processed_action]
+    
+    def get_current_norm_type(self) -> str:
+        """
+
+        
+        Returns:
+            Current normalization type
+        """
+        return self.current_norm_type

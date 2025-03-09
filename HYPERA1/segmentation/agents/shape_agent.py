@@ -1,17 +1,21 @@
 #!/usr/bin/env python
-# Shape Agent - Specialized agent for optimizing shape regularization
+# Shape Agent - Focuses on optimizing shape regularization
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
+from typing import Dict, List, Tuple, Any, Optional, Union
 
-from ..base_segmentation_agent import BaseSegmentationAgent
-from ..segmentation_state_manager import SegmentationStateManager
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.base_segmentation_agent import BaseSegmentationAgent
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
 
 class ShapeAgent(BaseSegmentationAgent):
     """
@@ -41,9 +45,19 @@ class ShapeAgent(BaseSegmentationAgent):
         self,
         state_manager: SegmentationStateManager,
         device: torch.device = None,
-        learning_rate: float = 0.001,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
         gamma: float = 0.99,
-        update_frequency: int = 5,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        lr: float = 3e-4,
+        automatic_entropy_tuning: bool = True,
+        update_frequency: int = 1,
+        log_dir: str = "logs",
         verbose: bool = False
     ):
         """
@@ -52,18 +66,38 @@ class ShapeAgent(BaseSegmentationAgent):
         Args:
             state_manager: Manager for shared state
             device: Device to use for computation
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor for future rewards
-            update_frequency: Frequency of agent updates
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
+            gamma: Discount factor
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            lr: Learning rate
+            automatic_entropy_tuning: Whether to automatically tune entropy
+            update_frequency: How often the agent should update (in steps)
+            log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
         super().__init__(
             name="ShapeAgent",
             state_manager=state_manager,
             device=device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=verbose
         )
         
@@ -104,7 +138,7 @@ class ShapeAgent(BaseSegmentationAgent):
         # Optimizer for policy network
         self.optimizer = torch.optim.Adam(
             list(self.feature_extractor.parameters()) + list(self.policy_network.parameters()),
-            lr=self.learning_rate
+            lr=self.lr
         )
         
         # Shape-specific parameters
@@ -132,389 +166,225 @@ class ShapeAgent(BaseSegmentationAgent):
         # Default shape prior
         self.current_shape_prior = "circular"
     
-    def observe(self) -> Dict[str, Any]:
+    def _initialize_agent(self):
         """
-        Observe the current state.
+        Initialize agent-specific parameters and networks.
+        """
+        # This method is called by the BaseSegmentationAgent constructor
+        # Shape-specific initialization is done in _init_shape_components
+        pass
+    
+    def _extract_features(self, observation: torch.Tensor) -> Dict[str, Any]:
+        """
+        Extract shape-specific features from the observation.
         
+        Args:
+            observation: The current observation
+            
         Returns:
-            Dictionary of observations
+            Dictionary of extracted features
         """
-        # Get current state from state manager
-        current_image = self.state_manager.get_current_image()
-        current_mask = self.state_manager.get_current_mask()
-        current_prediction = self.state_manager.get_current_prediction()
-        
-        if current_image is None or current_mask is None or current_prediction is None:
-            # If any required state is missing, return empty observation
+        if not isinstance(observation, dict):
             return {}
         
-        # Ensure tensors are on the correct device
-        current_image = current_image.to(self.device)
-        current_mask = current_mask.to(self.device)
+        # Extract current prediction from observation
+        current_prediction = observation.get("current_prediction", None)
+        if current_prediction is None:
+            return {}
+        
+        # Ensure prediction is a tensor
+        if not isinstance(current_prediction, torch.Tensor):
+            current_prediction = torch.tensor(current_prediction, device=self.device)
+        
+        # Ensure prediction is on the correct device
         current_prediction = current_prediction.to(self.device)
         
+        # Add batch dimension if needed
+        if len(current_prediction.shape) == 2:
+            current_prediction = current_prediction.unsqueeze(0)
+        
+        # Add channel dimension if needed
+        if len(current_prediction.shape) == 3:
+            current_prediction = current_prediction.unsqueeze(1)
+        
+        # Extract features using the feature extractor
+        shape_features = self.feature_extractor(current_prediction.float())
+        
         # Calculate shape metrics
-        shape_metrics = self._calculate_shape_metrics(current_prediction)
+        shape_metrics = observation.get("shape_metrics", {})
         
-        # Get recent metrics from state manager
-        recent_metrics = self.state_manager.get_recent_metrics()
-        
-        # Create observation dictionary
-        observation = {
-            "current_image": current_image,
-            "current_mask": current_mask,
-            "current_prediction": current_prediction,
-            "shape_metrics": shape_metrics,
-            "shape_regularization_strength": self.shape_regularization_strength,
-            "current_shape_prior": self.current_shape_prior,
-            "recent_metrics": recent_metrics
-        }
-        
-        # Store observation in history
-        self.observation_history.append(observation)
-        
-        return observation
-    
-    def _calculate_shape_metrics(self, prediction: torch.Tensor) -> Dict[str, float]:
-        """
-        Calculate shape metrics for the predicted mask.
-        
-        Args:
-            prediction: Predicted segmentation mask
-            
-        Returns:
-            Dictionary of shape metrics
-        """
-        # Convert tensor to numpy array
-        if isinstance(prediction, torch.Tensor):
-            prediction = prediction.detach().cpu().numpy()
-        
-        # Label connected components
-        from skimage.measure import label, regionprops
-        pred_labels = label(prediction > 0.5)
-        
-        # Get region properties
-        regions = regionprops(pred_labels)
-        
-        if not regions:
-            return {
-                "circularity": 0.0,
-                "aspect_ratio": 0.0,
-                "solidity": 0.0,
-                "num_objects": 0
-            }
-        
-        # Calculate shape metrics for each region
-        circularities = []
-        aspect_ratios = []
-        solidities = []
-        
-        for region in regions:
-            # Calculate perimeter and area
-            perimeter = region.perimeter
-            area = region.area
-            
-            if area > 0 and perimeter > 0:
-                # Calculate circularity (1.0 for perfect circle)
-                circularity = (4 * np.pi * area) / (perimeter**2)
-                circularities.append(circularity)
-                
-                # Calculate aspect ratio
-                if hasattr(region, 'major_axis_length') and hasattr(region, 'minor_axis_length'):
-                    if region.minor_axis_length > 0:
-                        aspect_ratio = region.major_axis_length / region.minor_axis_length
-                        aspect_ratios.append(aspect_ratio)
-                
-                # Calculate solidity (convex hull area ratio)
-                if hasattr(region, 'solidity'):
-                    solidity = region.solidity
-                    solidities.append(solidity)
-        
-        # Calculate average metrics
-        avg_circularity = np.mean(circularities) if circularities else 0.0
-        avg_aspect_ratio = np.mean(aspect_ratios) if aspect_ratios else 0.0
-        avg_solidity = np.mean(solidities) if solidities else 0.0
-        
-        # Create metrics dictionary
-        shape_metrics = {
-            "circularity": avg_circularity,
-            "aspect_ratio": avg_aspect_ratio,
-            "solidity": avg_solidity,
-            "num_objects": len(regions)
-        }
-        
-        return shape_metrics
-    
-    def decide(self, observation: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Decide on an action based on the observation.
-        
-        Args:
-            observation: Dictionary of observations
-            
-        Returns:
-            Dictionary of actions
-        """
-        if not observation:
-            # If observation is empty, return no action
-            return {}
-        
-        # Extract features from current image
-        current_image = observation["current_image"]
-        
-        # Ensure image has channel dimension
-        if len(current_image.shape) == 3:
-            current_image = current_image.unsqueeze(1)
-        
-        # Extract features
-        features = self.feature_extractor(current_image)
-        features = features.view(features.size(0), -1)
-        
-        # Get action logits from policy network
-        action_logits = self.policy_network(features)
-        
-        # Apply softmax to get action probabilities
-        action_probs = F.softmax(action_logits, dim=1)
-        
-        # Sample action from probabilities
-        if self.training:
-            action = torch.multinomial(action_probs, 1).item()
-        else:
-            action = torch.argmax(action_probs, dim=1).item()
-        
-        # Map action to shape regularization strength adjustment
-        if action == 0:
-            # Increase strength
-            new_strength = min(self.shape_regularization_strength + self.strength_step, self.max_strength)
-        elif action == 1:
-            # Decrease strength
-            new_strength = max(self.shape_regularization_strength - self.strength_step, self.min_strength)
-        else:
-            # Maintain current strength
-            new_strength = self.shape_regularization_strength
-        
-        # Determine best shape prior based on shape metrics
-        shape_metrics = observation["shape_metrics"]
-        new_shape_prior = self._select_shape_prior(shape_metrics)
-        
-        # Create action dictionary
-        action_dict = {
-            "shape_regularization_strength": new_strength,
-            "shape_prior": new_shape_prior,
-            "action_type": action,
-            "action_probs": action_probs.detach().cpu().numpy()
-        }
-        
-        # Store action in history
-        self.action_history.append(action_dict)
-        
-        # Update shape regularization strength and shape prior
-        self.shape_regularization_strength = new_strength
-        self.current_shape_prior = new_shape_prior
-        
-        return action_dict
-    
-    def _select_shape_prior(self, shape_metrics: Dict[str, float]) -> str:
-        """
-        Select the best shape prior based on shape metrics.
-        
-        Args:
-            shape_metrics: Dictionary of shape metrics
-            
-        Returns:
-            Selected shape prior
-        """
-        # Extract shape metrics
-        circularity = shape_metrics["circularity"]
-        aspect_ratio = shape_metrics["aspect_ratio"]
-        solidity = shape_metrics["solidity"]
-        
-        # Calculate distance to each shape prior
-        circular_distance = abs(circularity - self.shape_priors["circular"]["circularity_target"])
-        elongated_distance = abs(aspect_ratio - self.shape_priors["elongated"]["aspect_ratio_target"])
-        irregular_distance = abs(solidity - self.shape_priors["irregular"]["solidity_target"])
-        
-        # Normalize distances by tolerance
-        circular_distance /= self.shape_priors["circular"]["circularity_tolerance"]
-        elongated_distance /= self.shape_priors["elongated"]["aspect_ratio_tolerance"]
-        irregular_distance /= self.shape_priors["irregular"]["solidity_tolerance"]
-        
-        # Select shape prior with minimum normalized distance
-        distances = {
-            "circular": circular_distance,
-            "elongated": elongated_distance,
-            "irregular": irregular_distance
-        }
-        
-        return min(distances, key=distances.get)
-    
-    def learn(self, reward: float) -> Dict[str, float]:
-        """
-        Learn from the reward.
-        
-        Args:
-            reward: Reward value
-            
-        Returns:
-            Dictionary of learning metrics
-        """
-        # Store reward in history
-        self.reward_history.append(reward)
-        
-        # Check if it's time to update
-        current_step = self.state_manager.get_current_step()
-        if current_step - self.last_update_step < self.update_frequency:
-            return {}
-        
-        # Update last update step
-        self.last_update_step = current_step
-        
-        # Check if we have enough history for learning
-        if len(self.action_history) < 2 or len(self.reward_history) < 2:
-            return {}
-        
-        # Get the most recent observation, action, and reward
-        observation = self.observation_history[-1]
-        action = self.action_history[-1]
-        
-        # Extract features from current image
-        current_image = observation["current_image"]
-        
-        # Ensure image has channel dimension
-        if len(current_image.shape) == 3:
-            current_image = current_image.unsqueeze(1)
-        
-        # Extract features
-        features = self.feature_extractor(current_image)
-        features = features.view(features.size(0), -1)
-        
-        # Get action logits from policy network
-        action_logits = self.policy_network(features)
-        
-        # Calculate policy loss using REINFORCE algorithm
-        action_type = action["action_type"]
-        policy_loss = -action_logits[0, action_type] * reward
-        
-        # Backpropagate and optimize
-        self.optimizer.zero_grad()
-        policy_loss.backward()
-        self.optimizer.step()
-        
-        # Create learning metrics dictionary
-        metrics = {
-            "policy_loss": policy_loss.item(),
-            "reward": reward,
-            "shape_regularization_strength": self.shape_regularization_strength,
-            "shape_prior": self.current_shape_prior
-        }
-        
-        return metrics
-    
-    def get_state(self) -> Dict[str, Any]:
-        """
-        Get the current state of the agent.
-        
-        Returns:
-            Dictionary of agent state
-        """
         return {
-            "name": self.name,
-            "shape_regularization_strength": self.shape_regularization_strength,
-            "current_shape_prior": self.current_shape_prior,
-            "learning_rate": self.learning_rate,
-            "gamma": self.gamma,
-            "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history_length": len(self.action_history),
-            "reward_history_length": len(self.reward_history),
-            "observation_history_length": len(self.observation_history),
-            "training": self.training
+            "shape_features": shape_features,
+            "shape_metrics": shape_metrics,
+            "current_prediction": current_prediction
         }
     
-    def set_state(self, state: Dict[str, Any]) -> None:
+    def get_state_representation(self, observation: torch.Tensor) -> np.ndarray:
         """
-        Set the state of the agent.
+        Extract a state representation from the observation.
         
         Args:
-            state: Dictionary of agent state
+            observation: The current observation
+            
+        Returns:
+            State representation as a numpy array
         """
-        if "shape_regularization_strength" in state:
-            self.shape_regularization_strength = state["shape_regularization_strength"]
+        # Extract features from observation
+        features = self._extract_features(observation)
         
-        if "current_shape_prior" in state:
-            self.current_shape_prior = state["current_shape_prior"]
+        if not features:
+            # Return zero state if features extraction failed
+            return np.zeros(self.state_dim, dtype=np.float32)
         
-        if "learning_rate" in state:
-            self.learning_rate = state["learning_rate"]
-            # Update optimizer with new learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = self.learning_rate
+        # Get shape features
+        shape_features = features.get("shape_features", None)
+        if shape_features is None:
+            return np.zeros(self.state_dim, dtype=np.float32)
         
-        if "gamma" in state:
-            self.gamma = state["gamma"]
+        # Flatten shape features
+        shape_features_flat = shape_features.view(-1).detach().cpu().numpy()
         
-        if "update_frequency" in state:
-            self.update_frequency = state["update_frequency"]
+        # Get shape metrics
+        shape_metrics = features.get("shape_metrics", {})
         
-        if "training" in state:
-            self.training = state["training"]
+        # Create state representation
+        # Use a subset of features to match state_dim
+        state_representation = np.zeros(self.state_dim, dtype=np.float32)
+        
+        # Fill state representation with shape features and metrics
+        feature_count = min(self.state_dim - 3, len(shape_features_flat))
+        state_representation[:feature_count] = shape_features_flat[:feature_count]
+        
+        # Add shape regularization strength
+        state_representation[self.state_dim - 3] = self.shape_regularization_strength
+        
+        # Add shape prior indicators (one-hot encoding)
+        if self.current_shape_prior == "circular":
+            state_representation[self.state_dim - 2] = 1.0
+        elif self.current_shape_prior == "elongated":
+            state_representation[self.state_dim - 1] = 1.0
+        
+        return state_representation
     
-    def save(self, path: str) -> None:
+    def apply_action(self, action: np.ndarray, features: Dict[str, Any]) -> torch.Tensor:
         """
-        Save the agent to a file.
+        Apply the action to produce a segmentation decision.
         
         Args:
-            path: Path to save the agent
+            action: Action from the SAC policy
+            features: Dictionary of extracted features
+            
+        Returns:
+            Segmentation decision tensor
         """
-        # Create state dictionary
-        state_dict = {
-            "feature_extractor": self.feature_extractor.state_dict(),
-            "policy_network": self.policy_network.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "shape_regularization_strength": self.shape_regularization_strength,
-            "current_shape_prior": self.current_shape_prior,
-            "shape_priors": self.shape_priors,
-            "learning_rate": self.learning_rate,
-            "gamma": self.gamma,
-            "update_frequency": self.update_frequency,
-            "last_update_step": self.last_update_step,
-            "action_history": self.action_history,
-            "reward_history": self.reward_history,
-            "training": self.training
-        }
+        # Get current prediction from features
+        current_prediction = features.get("current_prediction", None)
+        if current_prediction is None:
+            return None
         
-        # Save state dictionary
-        torch.save(state_dict, path)
+        # Scale action to shape regularization strength adjustment
+        action_scaled = action[0] * self.strength_step
         
-        if self.verbose:
-            self.logger.info(f"Saved ShapeAgent to {path}")
+        # Update shape regularization strength
+        new_strength = self.shape_regularization_strength + action_scaled
+        self.shape_regularization_strength = max(self.min_strength, min(self.max_strength, new_strength))
+        
+        # Apply shape regularization to refine the prediction
+        refined_prediction = self._apply_shape_regularization(current_prediction)
+        
+        return refined_prediction
     
-    def load(self, path: str) -> None:
+    def _apply_shape_regularization(self, prediction: torch.Tensor) -> torch.Tensor:
         """
-        Load the agent from a file.
+        Apply shape regularization to refine the prediction.
         
         Args:
-            path: Path to load the agent from
+            prediction: Current prediction tensor
+            
+        Returns:
+            Refined prediction tensor
         """
-        # Load state dictionary
-        state_dict = torch.load(path, map_location=self.device)
+        # Convert to numpy for morphological operations
+        pred_np = prediction.detach().cpu().numpy()
         
-        # Load model parameters
-        self.feature_extractor.load_state_dict(state_dict["feature_extractor"])
-        self.policy_network.load_state_dict(state_dict["policy_network"])
-        self.optimizer.load_state_dict(state_dict["optimizer"])
+        # Apply morphological operations based on shape prior and regularization strength
+        from skimage import morphology
         
-        # Load agent parameters
-        self.shape_regularization_strength = state_dict["shape_regularization_strength"]
-        self.current_shape_prior = state_dict["current_shape_prior"]
-        self.shape_priors = state_dict["shape_priors"]
-        self.learning_rate = state_dict["learning_rate"]
-        self.gamma = state_dict["gamma"]
-        self.update_frequency = state_dict["update_frequency"]
-        self.last_update_step = state_dict["last_update_step"]
-        self.action_history = state_dict["action_history"]
-        self.reward_history = state_dict["reward_history"]
-        self.training = state_dict["training"]
+        # Determine structuring element size based on regularization strength
+        struct_size = max(1, int(3 * self.shape_regularization_strength))
         
-        if self.verbose:
-            self.logger.info(f"Loaded ShapeAgent from {path}")
+        if self.current_shape_prior == "circular":
+            # Use disk structuring element for circular shapes
+            selem = morphology.disk(struct_size)
+            # Apply opening to remove small protrusions
+            pred_np = morphology.opening(pred_np > 0.5, selem)
+            # Apply closing to fill small holes
+            pred_np = morphology.closing(pred_np, selem)
+        
+        elif self.current_shape_prior == "elongated":
+            # Use elliptical structuring element for elongated shapes
+            selem = morphology.ellipse(struct_size, 2 * struct_size)
+            # Apply opening and closing
+            pred_np = morphology.opening(pred_np > 0.5, selem)
+            pred_np = morphology.closing(pred_np, selem)
+        
+        else:  # irregular
+            # Use smaller structuring element for irregular shapes
+            selem = morphology.square(struct_size)
+            # Apply less aggressive morphological operations
+            pred_np = morphology.opening(pred_np > 0.5, selem)
+            pred_np = morphology.closing(pred_np, selem)
+        
+        # Convert back to tensor
+        refined_prediction = torch.tensor(pred_np.astype(np.float32), device=self.device)
+        
+        # Blend with original prediction based on regularization strength
+        if len(prediction.shape) == 4:
+            refined_prediction = refined_prediction.view(prediction.shape)
+        
+        blended_prediction = (1 - self.shape_regularization_strength) * prediction + \
+                             self.shape_regularization_strength * refined_prediction
+        
+        return blended_prediction
+    
+    def _save_agent_state(self, save_dict: Dict[str, Any]):
+        """
+        Add agent-specific state to the save dictionary.
+        
+        Args:
+            save_dict: Dictionary to add agent-specific state to
+        """
+        save_dict["shape_regularization_strength"] = self.shape_regularization_strength
+        save_dict["current_shape_prior"] = self.current_shape_prior
+        save_dict["shape_priors"] = self.shape_priors
+    
+    def _load_agent_state(self, checkpoint: Dict[str, Any]) -> bool:
+        """
+        Load agent-specific state from the checkpoint.
+        
+        Args:
+            checkpoint: Dictionary containing the agent state
+            
+        Returns:
+            Whether the load was successful
+        """
+        if "shape_regularization_strength" in checkpoint:
+            self.shape_regularization_strength = checkpoint["shape_regularization_strength"]
+        
+        if "current_shape_prior" in checkpoint:
+            self.current_shape_prior = checkpoint["current_shape_prior"]
+        
+        if "shape_priors" in checkpoint:
+            self.shape_priors = checkpoint["shape_priors"]
+        
+        return True
+    
+    def _reset_agent(self):
+        """
+        Reset agent-specific episode state.
+        """
+        # Reset shape regularization strength to initial value
+        self.shape_regularization_strength = 0.5
+        
+        # Reset to default shape prior
+        self.current_shape_prior = "circular"

@@ -28,7 +28,8 @@ class AgentCoordinator:
         update_frequency: int = 1,
         conflict_resolution_strategy: str = "priority",
         log_dir: Optional[str] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        change_callback: Optional[callable] = None
     ):
         """
         Initialize the agent coordinator.
@@ -40,6 +41,7 @@ class AgentCoordinator:
             conflict_resolution_strategy: Strategy for resolving conflicts ("priority", "voting", "consensus")
             log_dir: Directory for saving logs and agent states
             verbose: Whether to print verbose output
+            change_callback: Optional callback function to be called when an agent's action is applied
         """
         self.shared_state_manager = shared_state_manager
         self.agents = {} if agents is None else {agent.name: agent for agent in agents}
@@ -47,6 +49,7 @@ class AgentCoordinator:
         self.conflict_resolution_strategy = conflict_resolution_strategy
         self.log_dir = log_dir
         self.verbose = verbose
+        self.change_callback = change_callback
         
         # Set up logging
         self.logger = logging.getLogger(__name__)
@@ -96,6 +99,30 @@ class AgentCoordinator:
                 self.logger.info(f"Removed agent: {agent_name}")
             return True
         return False
+    
+    def register_agent(self, agent: BaseHyperparameterAgent):
+        """
+        Register a new agent with the coordinator.
+        
+        Args:
+            agent: The agent to register
+        """
+        if agent.name in self.agents:
+            logging.warning(f"Agent with name {agent.name} already registered. Overwriting.")
+        
+        self.agents[agent.name] = agent
+        if self.verbose:
+            logging.info(f"Registered agent: {agent.name}")
+            
+    def register_agents(self, agents: List[BaseHyperparameterAgent]):
+        """
+        Register multiple agents with the coordinator.
+        
+        Args:
+            agents: List of agents to register
+        """
+        for agent in agents:
+            self.register_agent(agent)
     
     def update(self, epoch: int) -> Dict[str, Any]:
         """
@@ -149,6 +176,10 @@ class AgentCoordinator:
                 applied_actions[param_name] = result
                 if self.verbose:
                     self.logger.info(f"Applied action from {agent.name}: {param_name} = {result}")
+                
+                # Call change callback if provided
+                if self.change_callback:
+                    self.change_callback(param_name, result)
         
         return applied_actions
     

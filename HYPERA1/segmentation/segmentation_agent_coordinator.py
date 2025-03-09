@@ -337,3 +337,118 @@ class SegmentationAgentCoordinator:
         
         if self.verbose:
             self.logger.info("Reset all agents")
+
+    def refine_segmentation(self, initial_preds: torch.Tensor) -> torch.Tensor:
+        """
+        Refine segmentation predictions using the agents.
+        
+        Args:
+            initial_preds: Initial segmentation predictions from the base model
+            
+        Returns:
+            Refined segmentation predictions
+        """
+        # Update the state manager with the initial predictions
+        self.state_manager.update_segmentation(initial_preds)
+        
+        # Create observation from initial predictions
+        # This typically includes the initial segmentation and any relevant features
+        observation = {
+            'current_segmentation': initial_preds,
+            'ground_truth': self.state_manager.get_current_ground_truth()
+        }
+        
+        # Process the observation with all agents to get features
+        features = {}
+        for agent in self.agents:
+            # Get state representation from the agent
+            state = agent.get_state_representation(observation)
+            
+            # Use the agent's policy to select an action
+            action = agent.sac.select_action(state)
+            
+            # Apply the action to get refined segmentation
+            agent_refined = agent.apply_action(action)
+            
+            # Store the agent's refinement
+            features[agent.name] = agent_refined
+        
+        # Combine the refinements from all agents
+        if not features:
+            # If no refinements, return the initial predictions
+            return initial_preds
+        
+        # Use weighted averaging to combine refinements
+        combined = None
+        total_weight = 0
+        
+        for agent_name, refinement in features.items():
+            weight = self.agent_weights.get(agent_name, 1.0)
+            if combined is None:
+                combined = weight * refinement
+            else:
+                combined += weight * refinement
+            total_weight += weight
+        
+        if total_weight > 0:
+            combined /= total_weight
+        
+        # Apply thresholding to get binary segmentation
+        refined_preds = (combined > 0.5).float()
+        
+        # Update the state manager with the refined segmentation
+        self.state_manager.update_segmentation(refined_preds)
+        
+        return refined_preds
+
+    def save(self, path):
+        """
+        Save the coordinator and its agents.
+        
+        Args:
+            path: Path to save the coordinator
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Save coordinator state
+        state_dict = {
+            'conflict_resolution': self.conflict_resolution,
+            'agent_names': [agent.name for agent in self.agents]
+        }
+        
+        # Save the coordinator state
+        torch.save(state_dict, path)
+        
+        # Save each agent in the same directory
+        for agent in self.agents:
+            agent_path = os.path.join(os.path.dirname(path), f"{agent.name}_agent.pt")
+            agent.save(agent_path)
+            
+        if self.verbose:
+            logging.info(f"Saved coordinator to {path}")
+            
+    def load(self, path):
+        """
+        Load the coordinator and its agents.
+        
+        Args:
+            path: Path to load the coordinator from
+        """
+        # Load coordinator state
+        state_dict = torch.load(path)
+        
+        # Set coordinator attributes
+        self.conflict_resolution = state_dict['conflict_resolution']
+        
+        # Load each agent
+        for agent_name in state_dict['agent_names']:
+            agent_path = os.path.join(os.path.dirname(path), f"{agent_name}_agent.pt")
+            # Find the agent with this name
+            for agent in self.agents:
+                if agent.name == agent_name:
+                    agent.load(agent_path)
+                    break
+                    
+        if self.verbose:
+            logging.info(f"Loaded coordinator from {path}")

@@ -186,10 +186,10 @@ class GaussianPolicy(nn.Module):
             self.action_scale = torch.tensor(1.0)
             self.action_bias = torch.tensor(0.0)
         else:
-            self.action_scale = torch.FloatTensor(
-                (action_space[1] - action_space[0]) / 2.0)
-            self.action_bias = torch.FloatTensor(
-                (action_space[1] + action_space[0]) / 2.0)
+            # Ensure action_space is properly handled as a tuple of two values
+            min_action, max_action = action_space
+            self.action_scale = torch.tensor((max_action - min_action) / 2.0)
+            self.action_bias = torch.tensor((max_action + min_action) / 2.0)
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -252,4 +252,11 @@ class GaussianPolicy(nn.Module):
         """Move the model to the specified device."""
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
-        return super(GaussianPolicy, self).to(device)
+        
+        # Move all nn.Module components to the device
+        for attr_str in dir(self):
+            attr = getattr(self, attr_str)
+            if isinstance(attr, nn.Module):
+                attr.to(device)
+                
+        return self

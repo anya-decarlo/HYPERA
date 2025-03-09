@@ -40,44 +40,68 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         n_step: int = 3,
         stability_weight: float = 0.3,
         generalization_weight: float = 0.4,
-        efficiency_weight: float = 0.3
+        efficiency_weight: float = 0.3,
+        use_adaptive_scaling: bool = True,
+        use_phase_aware_scaling: bool = True,
+        auto_balance_components: bool = True,
+        reward_clip_range: Optional[Tuple[float, float]] = None,
+        reward_scaling_window: int = 100,
+        device: Optional[torch.device] = None,
+        name: str = "class_weights_agent",
+        priority: int = 0
     ):
         """
         Initialize the class weights agent.
         
         Args:
-            shared_state_manager: Manager for shared state across agents
-            initial_class_weights: Initial class weights dictionary {class_id: weight}
-            min_weight: Minimum allowed class weight
-            max_weight: Maximum allowed class weight
-            num_classes: Number of classes in the segmentation task
-            update_frequency: How often to consider updates (in epochs)
+            shared_state_manager: Manager for shared state between agents
+            initial_class_weights: Initial class weights (optional)
+            min_weight: Minimum class weight
+            max_weight: Maximum class weight
+            num_classes: Number of classes
+            update_frequency: How often to update class weights (in epochs)
             patience: Epochs to wait before considering action
             cooldown: Epochs to wait after an action
-            log_dir: Directory for saving logs
+            log_dir: Directory for saving logs and agent states
             verbose: Whether to print verbose output
-            metrics_to_track: List of metrics to include in state representation
-            state_dim: Dimension of state representation
-            hidden_dim: Hidden dimension for SAC networks
+            metrics_to_track: List of metrics to track
+            state_dim: Dimension of state space
+            hidden_dim: Dimension of hidden layers
             use_enhanced_state: Whether to use enhanced state representation
-            eligibility_trace_length: Length of eligibility traces for reward calculation
+            eligibility_trace_length: Length of eligibility traces
             n_step: Number of steps for n-step returns
-            stability_weight: Weight for stability component in reward
-            generalization_weight: Weight for generalization component in reward
-            efficiency_weight: Weight for efficiency component in reward
+            stability_weight: Weight for stability component of reward
+            generalization_weight: Weight for generalization component of reward
+            efficiency_weight: Weight for efficiency component of reward
+            use_adaptive_scaling: Whether to use adaptive reward scaling
+            use_phase_aware_scaling: Whether to use phase-aware scaling
+            auto_balance_components: Whether to auto-balance reward components
+            reward_clip_range: Range for clipping rewards
+            reward_scaling_window: Window size for reward statistics
+            device: Device to use for training
+            name: Name of agent
+            priority: Priority of the agent (higher means more important)
         """
         # Initialize default class weights if not provided
         if initial_class_weights is None:
             initial_class_weights = {i: 1.0 for i in range(num_classes)}
         
+        # Set default device if not provided
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        # Set default reward clip range if not provided
+        if reward_clip_range is None:
+            reward_clip_range = (-10.0, 10.0)
+            
         super().__init__(
-            name="class_weights",
+            name=name,
             hyperparameter_key="class_weights",
             shared_state_manager=shared_state_manager,
             state_dim=state_dim,
-            action_dim=num_classes,  # One action dimension per class
-            action_space=(-1.0, 1.0),  # Normalized action space
             hidden_dim=hidden_dim,
+            action_dim=num_classes,
+            action_space=(-1.0, 1.0),
             update_frequency=update_frequency,
             patience=patience,
             cooldown=cooldown,
@@ -87,7 +111,14 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
             n_step=n_step,
             stability_weight=stability_weight,
             generalization_weight=generalization_weight,
-            efficiency_weight=efficiency_weight
+            efficiency_weight=efficiency_weight,
+            use_adaptive_scaling=use_adaptive_scaling,
+            use_phase_aware_scaling=use_phase_aware_scaling,
+            auto_balance_components=auto_balance_components,
+            reward_clip_range=reward_clip_range,
+            reward_scaling_window=reward_scaling_window,
+            device=device,
+            priority=priority
         )
         
         # Class weights specific parameters
@@ -98,11 +129,14 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         self.use_enhanced_state = use_enhanced_state
         
         # Initialize class weights
-        self.current_class_weights = initial_class_weights.copy()
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_class_weights)
+        self.current_class_weights = initial_class_weights
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_class_weights)
+        
+        # Add epochs_since_update attribute
+        self.epochs_since_update = 0
         
         # Log initialization
-        self.log(f"Initialized with class_weights={self.current_class_weights}")
+        logging.info(f"Initialized with class_weights={self.current_class_weights}")
     
     def get_state_representation(self) -> np.ndarray:
         """
@@ -136,7 +170,12 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
                     state_components.extend(list(overfitting_signals.values()))
                 
                 # Add normalized current class weights
-                for weight in self.current_class_weights.values():
+                if isinstance(self.current_class_weights, dict):
+                    weights = list(self.current_class_weights.values())
+                else:
+                    weights = self.current_class_weights if isinstance(self.current_class_weights, np.ndarray) else np.array(self.current_class_weights)
+                
+                for weight in weights:
                     normalized_weight = (weight - self.min_weight) / (self.max_weight - self.min_weight)
                     state_components.append(normalized_weight)
                 
@@ -208,7 +247,12 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
                 state_components.extend([0.0, 0.0])
         
         # Add normalized current class weights
-        for weight in self.current_class_weights.values():
+        if isinstance(self.current_class_weights, dict):
+            weights = list(self.current_class_weights.values())
+        else:
+            weights = self.current_class_weights if isinstance(self.current_class_weights, np.ndarray) else np.array(self.current_class_weights)
+        
+        for weight in weights:
             normalized_weight = (weight - self.min_weight) / (self.max_weight - self.min_weight)
             state_components.append(normalized_weight)
         
@@ -246,7 +290,7 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         
         return state
     
-    def action_to_hyperparameter(self, action: np.ndarray) -> np.ndarray:
+    def action_to_hyperparameter(self, action):
         """
         Convert normalized actions to actual class weight values.
         
@@ -256,6 +300,19 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         Returns:
             New class weight values
         """
+        # Handle both scalar and array/list actions
+        if not isinstance(action, (list, np.ndarray)):
+            # If action is a scalar, create a default array with small adjustments
+            action = np.ones(self.num_classes) * 0.1
+        elif len(action) != self.num_classes:
+            # If action length doesn't match number of classes, pad or truncate
+            if len(action) < self.num_classes:
+                # Pad with zeros
+                action = np.pad(action, (0, self.num_classes - len(action)), 'constant')
+            else:
+                # Truncate
+                action = action[:self.num_classes]
+        
         # Convert actions to multiplicative factors
         # Action -1.0 -> divide by 2
         # Action 0.0 -> no change
@@ -263,7 +320,12 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         factors = 2.0 ** action
         
         # Apply factors to current class weights
-        new_weights = np.array(list(self.current_class_weights.values())) * factors
+        if isinstance(self.current_class_weights, dict):
+            current_weights = np.array(list(self.current_class_weights.values()))
+        else:
+            current_weights = self.current_class_weights if isinstance(self.current_class_weights, np.ndarray) else np.array(self.current_class_weights)
+        
+        new_weights = current_weights * factors
         
         # Clip to valid range
         new_weights = np.clip(new_weights, self.min_weight, self.max_weight)
@@ -289,18 +351,23 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         new_weights = self.action_to_hyperparameter(action)
         
         # Calculate relative changes
-        relative_changes = new_weights / np.array(list(self.current_class_weights.values()))
+        if isinstance(self.current_class_weights, dict):
+            current_weights = np.array(list(self.current_class_weights.values()))
+        else:
+            current_weights = self.current_class_weights if isinstance(self.current_class_weights, np.ndarray) else np.array(self.current_class_weights)
+        
+        relative_changes = new_weights / current_weights
         
         # Update current values
-        old_weights = self.current_class_weights.copy()
-        self.current_class_weights = {i: weight for i, weight in enumerate(new_weights)}
+        old_weights = self.current_class_weights.copy() if hasattr(self.current_class_weights, 'copy') else np.copy(self.current_class_weights)
+        self.current_class_weights = new_weights
         
         # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_class_weights)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_class_weights)
         
         # Log update
-        self.log(f"Updated class_weights: {old_weights} -> {self.current_class_weights}")
-        self.log(f"Relative changes: {relative_changes.tolist()}")
+        logging.info(f"Updated class_weights: {old_weights} -> {self.current_class_weights}")
+        logging.info(f"Relative changes: {relative_changes.tolist()}")
         
         # Return update info
         return {
@@ -310,7 +377,7 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
             "hyperparameter": self.hyperparameter_key
         }
     
-    def _process_action(self, action: np.ndarray) -> Dict[int, float]:
+    def _process_action(self, action):
         """
         Process the action from SAC to get the new class weights.
         
@@ -320,6 +387,7 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         Returns:
             New class weights dictionary
         """
+        # Handle both scalar and array/list actions
         return self.action_to_hyperparameter(action)
     
     def _apply_action(self, new_class_weights: Dict[int, float]) -> None:
@@ -334,10 +402,29 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
         self.current_class_weights = new_class_weights
         
         # Update shared state
-        self.shared_state_manager.update_hyperparameter(self.hyperparameter_key, self.current_class_weights)
+        self.shared_state_manager.set_hyperparameter(self.hyperparameter_key, self.current_class_weights)
         
         # Log update
-        self.log(f"Updated class_weights: {old_class_weights} -> {self.current_class_weights}")
+        logging.info(f"Updated class_weights: {old_class_weights} -> {self.current_class_weights}")
+    
+    def select_action(self, epoch: int) -> Optional[Dict[int, float]]:
+        """
+        Select an action based on the current state.
+        
+        Args:
+            epoch: Current training epoch
+            
+        Returns:
+            Action value (class weights) or None if no action should be taken
+        """
+        if not self.should_update(epoch):
+            return None
+            
+        state = self.get_state_representation()
+        action = self.sac.select_action(state)
+        processed_action = self._process_action(action)
+        
+        return processed_action
     
     def _get_state_representation(self) -> np.ndarray:
         """
@@ -347,3 +434,12 @@ class ClassWeightsAgent(BaseHyperparameterAgent):
             State representation as numpy array
         """
         return self.get_state_representation()
+
+    def get_current_class_weights(self) -> Dict[int, float]:
+        """
+        Get the current class weights.
+        
+        Returns:
+            Current class weights dictionary
+        """
+        return self.current_class_weights

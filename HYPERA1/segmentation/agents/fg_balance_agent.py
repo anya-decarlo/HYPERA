@@ -2,6 +2,7 @@
 # Foreground-Background Balance Agent - Specialized agent for optimizing class balance
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,8 +11,11 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 import logging
 import time
 
-from ..base_segmentation_agent import BaseSegmentationAgent
-from ..segmentation_state_manager import SegmentationStateManager
+# Add the parent directory to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from HYPERA1.segmentation.base_segmentation_agent import BaseSegmentationAgent
+from HYPERA1.segmentation.segmentation_state_manager import SegmentationStateManager
 
 class FGBalanceAgent(BaseSegmentationAgent):
     """
@@ -42,9 +46,19 @@ class FGBalanceAgent(BaseSegmentationAgent):
         self,
         state_manager: SegmentationStateManager,
         device: torch.device = None,
-        learning_rate: float = 0.001,
+        state_dim: int = 10,
+        action_dim: int = 1,
+        action_space: Tuple[float, float] = (-1.0, 1.0),
+        hidden_dim: int = 256,
+        replay_buffer_size: int = 10000,
+        batch_size: int = 64,
         gamma: float = 0.99,
-        update_frequency: int = 5,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        lr: float = 3e-4,
+        automatic_entropy_tuning: bool = True,
+        update_frequency: int = 2,
+        log_dir: str = "logs",
         verbose: bool = False
     ):
         """
@@ -53,18 +67,42 @@ class FGBalanceAgent(BaseSegmentationAgent):
         Args:
             state_manager: Manager for shared state
             device: Device to use for computation
-            learning_rate: Learning rate for optimizer
+            state_dim: Dimension of state space
+            action_dim: Dimension of action space
+            action_space: Tuple of (min_action, max_action)
+            hidden_dim: Dimension of hidden layers in networks
+            replay_buffer_size: Size of replay buffer
+            batch_size: Batch size for training
             gamma: Discount factor for future rewards
+            tau: Target network update rate
+            alpha: Temperature parameter for entropy
+            lr: Learning rate
+            automatic_entropy_tuning: Whether to automatically tune entropy
             update_frequency: Frequency of agent updates
+            log_dir: Directory for saving logs and checkpoints
             verbose: Whether to print verbose output
         """
+        # Store feature extraction parameters
+        self.feature_channels = 32
+        self.hidden_channels = 64
+        
         super().__init__(
             name="FGBalanceAgent",
             state_manager=state_manager,
             device=device,
-            learning_rate=learning_rate,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_space=action_space,
+            hidden_dim=hidden_dim,
+            replay_buffer_size=replay_buffer_size,
+            batch_size=batch_size,
             gamma=gamma,
+            tau=tau,
+            alpha=alpha,
+            lr=lr,
+            automatic_entropy_tuning=automatic_entropy_tuning,
             update_frequency=update_frequency,
+            log_dir=log_dir,
             verbose=verbose
         )
         
@@ -105,7 +143,7 @@ class FGBalanceAgent(BaseSegmentationAgent):
         # Optimizer for policy network
         self.optimizer = torch.optim.Adam(
             list(self.feature_extractor.parameters()) + list(self.policy_network.parameters()),
-            lr=self.learning_rate
+            lr=self.lr
         )
         
         # Balance-specific parameters
@@ -497,3 +535,233 @@ class FGBalanceAgent(BaseSegmentationAgent):
         
         if self.verbose:
             self.logger.info(f"Loaded FGBalanceAgent from {path}")
+    
+    def _initialize_agent(self):
+        """
+        Initialize the agent's networks and components.
+        """
+        # Feature extractor for balance features
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((8, 8))
+        ).to(self.device)
+        
+        # Policy network for balance-specific actions
+        self.policy_network = nn.Sequential(
+            nn.Linear(64 * 8 * 8 + 2, 256),  # +2 for current fg ratio and target fg ratio
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)  # 3 actions: increase, decrease, or maintain threshold
+        ).to(self.device)
+        
+        # Optimizer for policy network
+        self.optimizer = torch.optim.Adam(
+            list(self.feature_extractor.parameters()) + list(self.policy_network.parameters()),
+            lr=self.lr
+        )
+        
+        # Balance-specific parameters
+        self.segmentation_threshold = 0.5  # Initial segmentation threshold
+        self.min_threshold = 0.1
+        self.max_threshold = 0.9
+        self.threshold_step = 0.05
+        
+        # Target foreground ratio (will be updated based on ground truth)
+        self.target_fg_ratio = 0.5
+        
+        # Moving average of foreground ratio
+        self.avg_fg_ratio = 0.5
+        self.avg_decay = 0.9  # Decay factor for moving average
+        
+        if self.verbose:
+            self.logger.info("Initialized FGBalanceAgent components")
+    
+    def _extract_features(self, observation):
+        """
+        Extract features from the observation.
+        
+        Args:
+            observation: Dictionary containing observation data
+            
+        Returns:
+            Extracted features
+        """
+        # Extract image and prediction from observation
+        current_image = observation.get("current_image")
+        current_prediction = observation.get("current_prediction")
+        
+        if current_image is None or current_prediction is None:
+            # Return zero features if data is missing
+            return torch.zeros((1, 64 * 8 * 8 + 2), device=self.device)
+        
+        # Ensure tensors are on the correct device
+        current_image = current_image.to(self.device)
+        current_prediction = current_prediction.to(self.device)
+        
+        # Get foreground ratios
+        pred_fg_ratio = observation.get("pred_fg_ratio", 0.5)
+        target_fg_ratio = observation.get("target_fg_ratio", 0.5)
+        
+        # Extract features using feature extractor
+        # Use prediction as input to feature extractor
+        if current_prediction.dim() == 3:
+            # Add channel dimension if needed
+            current_prediction = current_prediction.unsqueeze(1)
+        elif current_prediction.dim() == 4:
+            # Use first channel if multiple channels
+            current_prediction = current_prediction[:, 0:1]
+        
+        # Extract features
+        visual_features = self.feature_extractor(current_prediction)
+        visual_features = visual_features.view(-1, 64 * 8 * 8)
+        
+        # Combine visual features with foreground ratio information
+        ratio_features = torch.tensor([[pred_fg_ratio, target_fg_ratio]], device=self.device)
+        combined_features = torch.cat([visual_features, ratio_features], dim=1)
+        
+        return combined_features
+    
+    def get_state_representation(self, observation):
+        """
+        Get state representation from observation.
+        
+        Args:
+            observation: Dictionary containing observation data
+            
+        Returns:
+            State representation
+        """
+        # Extract features from observation
+        features = self._extract_features(observation)
+        
+        # Return features as state representation
+        return features
+    
+    def apply_action(self, action):
+        """
+        Apply the selected action to modify the segmentation.
+        
+        Args:
+            action: Action to apply
+            
+        Returns:
+            Modified segmentation
+        """
+        # Get current prediction from state manager
+        current_prediction = self.state_manager.get_current_prediction()
+        
+        if current_prediction is None:
+            # Return None if no prediction is available
+            return None
+        
+        # Ensure tensor is on the correct device
+        current_prediction = current_prediction.to(self.device)
+        
+        # Interpret action
+        # Action is a tensor with shape [batch_size, action_dim]
+        # For FGBalanceAgent, we interpret the action as a change to the segmentation threshold
+        action_value = action.item() if isinstance(action, torch.Tensor) else action
+        
+        # Adjust threshold based on action
+        if action_value < -0.33:  # Decrease threshold (increase foreground)
+            self.segmentation_threshold = max(self.min_threshold, self.segmentation_threshold - self.threshold_step)
+        elif action_value > 0.33:  # Increase threshold (decrease foreground)
+            self.segmentation_threshold = min(self.max_threshold, self.segmentation_threshold + self.threshold_step)
+        # Otherwise, maintain current threshold
+        
+        # Apply threshold to create binary segmentation
+        binary_prediction = (current_prediction > self.segmentation_threshold).float()
+        
+        # Update prediction in state manager
+        self.state_manager.set_current_prediction(binary_prediction)
+        
+        return binary_prediction
+    
+    def _save_agent_state(self, path):
+        """
+        Save agent state to file.
+        
+        Args:
+            path: Path to save agent state
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Save model state
+        state_dict = {
+            'feature_extractor': self.feature_extractor.state_dict(),
+            'policy_network': self.policy_network.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'segmentation_threshold': self.segmentation_threshold,
+            'target_fg_ratio': self.target_fg_ratio,
+            'avg_fg_ratio': self.avg_fg_ratio
+        }
+        
+        # Save to file
+        torch.save(state_dict, path)
+        
+        if self.verbose:
+            self.logger.info(f"Saved FGBalanceAgent state to {path}")
+    
+    def _load_agent_state(self, path):
+        """
+        Load agent state from file.
+        
+        Args:
+            path: Path to load agent state from
+        """
+        if not os.path.exists(path):
+            if self.verbose:
+                self.logger.warning(f"Agent state file {path} does not exist")
+            return False
+        
+        try:
+            # Load state dict
+            state_dict = torch.load(path, map_location=self.device)
+            
+            # Load model state
+            self.feature_extractor.load_state_dict(state_dict['feature_extractor'])
+            self.policy_network.load_state_dict(state_dict['policy_network'])
+            self.optimizer.load_state_dict(state_dict['optimizer'])
+            self.segmentation_threshold = state_dict['segmentation_threshold']
+            self.target_fg_ratio = state_dict['target_fg_ratio']
+            self.avg_fg_ratio = state_dict['avg_fg_ratio']
+            
+            if self.verbose:
+                self.logger.info(f"Loaded FGBalanceAgent state from {path}")
+            
+            return True
+        except Exception as e:
+            if self.verbose:
+                self.logger.error(f"Error loading agent state: {e}")
+            return False
+    
+    def _reset_agent(self):
+        """
+        Reset the agent to its initial state.
+        """
+        # Reset agent-specific parameters
+        self.segmentation_threshold = 0.5
+        self.target_fg_ratio = 0.5
+        self.avg_fg_ratio = 0.5
+        
+        # Reset history
+        self.action_history = []
+        self.reward_history = []
+        self.observation_history = []
+        
+        # Re-initialize networks
+        self._initialize_agent()
+        
+        if self.verbose:
+            self.logger.info("Reset FGBalanceAgent to initial state")
