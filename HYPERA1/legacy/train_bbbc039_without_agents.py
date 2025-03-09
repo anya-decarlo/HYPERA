@@ -372,14 +372,14 @@ def main():
     # Define loss function
     if args.loss == "Dice":
         loss_function = DiceLoss(
-            include_background=True,
+            include_background=False,
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
             reduction="mean"
         )
     elif args.loss == "DiceCE":
         loss_function = DiceCELoss(
-            include_background=True,
+            include_background=False,
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
             lambda_ce=1.0,
@@ -388,7 +388,7 @@ def main():
         )
     elif args.loss == "Focal":
         loss_function = FocalLoss(
-            include_background=True,
+            include_background=False,
             to_onehot_y=False,  # Labels are already one-hot encoded
             gamma=2.0,
             reduction="mean"
@@ -397,7 +397,7 @@ def main():
         raise ValueError(f"Unsupported loss function: {args.loss}")
     
     # Define metrics for evaluation
-    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
     
     # Define post-processing transforms - we'll use a default threshold of 0.5 initially
     # The threshold will be updated by the agents during training

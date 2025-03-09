@@ -1,34 +1,19 @@
 #!/usr/bin/env python
-# BBBC039 Training Script with Agents and Backpropagation Integration
+# BBBC039 Training Script with Backpropagation Only
 
 """
-This script implements a training pipeline for the BBBC039 dataset that integrates
-both backpropagation and agent-based hyperparameter optimization.
+This script implements a training pipeline for the BBBC039 dataset that uses
+only standard backpropagation for model training, without any agent-based
+hyperparameter optimization.
 
-Integration of Backpropagation and Agents:
-------------------------------------------
-1. Standard Backpropagation:
-   - Used for the primary model training through the standard PyTorch optimization
-   - Computes gradients and updates model weights based on the loss function
+Standard Backpropagation:
+-------------------------
+- Used for the primary model training through the standard PyTorch optimization
+- Computes gradients and updates model weights based on the loss function
+- Uses fixed hyperparameters throughout training
 
-2. Agent-Based Hyperparameter Optimization:
-   - Agents observe training metrics and make decisions to optimize hyperparameters
-   - Hyperparameters like learning rate, weight decay, etc. are adjusted by agents
-
-3. Integration Mechanism:
-   - Gradient statistics from backpropagation are recorded and shared with agents
-   - Agents can use gradient information to make better decisions
-   - The shared state manager serves as the communication channel between
-     backpropagation and agents
-
-4. Feedback Loop:
-   - Backpropagation → Compute gradient statistics → Share with agents
-   - Agents → Update hyperparameters → Affect next backpropagation step
-   - This creates a continuous feedback loop where each system informs the other
-
-This approach allows us to leverage the strengths of both systems:
-- Backpropagation for efficient weight updates
-- Agents for dynamic hyperparameter optimization based on training dynamics
+This script is a simplified version that removes the agent-based hyperparameter
+optimization to provide a baseline for comparison.
 """
 
 import os
@@ -160,9 +145,9 @@ def convert_to_five_class_onehot(x):
     """Convert a tensor to one-hot encoding with 5 classes (BBBC039 dataset)."""
     return convert_to_onehot(x, 5)
 
-def setup_agent_logging(log_dir):
+def setup_metrics_logging(log_dir):
     """
-    Set up CSV logging for agent activities.
+    Set up CSV logging for training metrics.
     
     Args:
         log_dir: Directory to save log files
@@ -174,34 +159,25 @@ def setup_agent_logging(log_dir):
     
     # Create CSV files for different types of logs
     log_files = {
-        'hyperparameters': open(os.path.join(log_dir, 'hyperparameters.csv'), 'w', newline=''),
-        'agent_actions': open(os.path.join(log_dir, 'agent_actions.csv'), 'w', newline=''),
-        'agent_rewards': open(os.path.join(log_dir, 'agent_rewards.csv'), 'w', newline=''),
-        'agent_states': open(os.path.join(log_dir, 'agent_states.csv'), 'w', newline=''),
-        'metrics': open(os.path.join(log_dir, 'metrics.csv'), 'w', newline='')
+        'metrics': open(os.path.join(log_dir, 'metrics.csv'), 'w', newline=''),
+        'hyperparameters': open(os.path.join(log_dir, 'hyperparameters.csv'), 'w', newline='')
     }
     
     # Create CSV writers
     csv_writers = {
-        'hyperparameters': csv.writer(log_files['hyperparameters']),
-        'agent_actions': csv.writer(log_files['agent_actions']),
-        'agent_rewards': csv.writer(log_files['agent_rewards']),
-        'agent_states': csv.writer(log_files['agent_states']),
-        'metrics': csv.writer(log_files['metrics'])
+        'metrics': csv.writer(log_files['metrics']),
+        'hyperparameters': csv.writer(log_files['hyperparameters'])
     }
     
     # Write headers
-    csv_writers['hyperparameters'].writerow(['Epoch', 'Agent', 'Parameter', 'Old Value', 'New Value', 'Change Magnitude'])
-    csv_writers['agent_actions'].writerow(['Epoch', 'Agent', 'Action', 'Applied'])
-    csv_writers['agent_rewards'].writerow(['Epoch', 'Agent', 'Reward', 'Stability', 'Generalization', 'Efficiency'])
-    csv_writers['agent_states'].writerow(['Epoch', 'Agent', 'State'])
     csv_writers['metrics'].writerow(['Epoch', 'Loss', 'Dice Score', 'Val Loss', 'Val Dice Score'])
+    csv_writers['hyperparameters'].writerow(['Epoch', 'Parameter', 'Value'])
     
     return {'writers': csv_writers, 'files': log_files}
 
 def main():
     # Parse command line arguments for hyperparameters
-    parser = argparse.ArgumentParser(description="Train a segmentation model on BBBC039 dataset with agents")
+    parser = argparse.ArgumentParser(description="Train a segmentation model on BBBC039 dataset with backpropagation")
     parser.add_argument("--optimizer", type=str, default="SGD", choices=["Adam", "SGD", "RMSprop"], 
                         help="Optimizer type")
     parser.add_argument("--loss", type=str, default="DiceCE", choices=["Dice", "DiceCE", "Focal"], 
@@ -223,18 +199,6 @@ def main():
         help="Initial learning rate for optimizer"
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    
-    # Agent system specific arguments
-    parser.add_argument("--conflict_resolution", type=str, default="priority", 
-                        choices=["priority", "voting", "consensus"], 
-                        help="Strategy for resolving conflicts between agents")
-    parser.add_argument("--agent_update_frequency", type=int, default=1, 
-                        help="Global update frequency for all agents")
-    
-    # Add command line argument for experiment type
-    parser.add_argument("--experiment_type", type=str, default="agent_factory", 
-                        choices=["agent_factory", "no_agent", "grid_search"], 
-                        help="Type of experiment to run")
     
     # Add command line argument for output directory (for Google Cloud compatibility)
     parser.add_argument("--output_dir", type=str, default=None,
@@ -260,18 +224,18 @@ def main():
             # Google Cloud Storage path
             # We'll still create local directories for temporary files
             results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                                      "results", "bbbc039", args.experiment_type, f"training_{timestamp}")
-            cloud_results_dir = os.path.join(args.output_dir, args.experiment_type, f"training_{timestamp}")
+                                      "results", "bbbc039", "backprop_only", f"training_{timestamp}")
+            cloud_results_dir = os.path.join(args.output_dir, "backprop_only", f"training_{timestamp}")
             using_cloud_storage = True
             print(f"Using Google Cloud Storage path: {cloud_results_dir}")
         else:
             # Local path
-            results_dir = os.path.join(args.output_dir, args.experiment_type, f"training_{timestamp}")
+            results_dir = os.path.join(args.output_dir, "backprop_only", f"training_{timestamp}")
             using_cloud_storage = False
     else:
         # Default local path
         results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                                  "results", "bbbc039", args.experiment_type, f"training_{timestamp}")
+                                  "results", "bbbc039", "backprop_only", f"training_{timestamp}")
         using_cloud_storage = False
     
     os.makedirs(results_dir, exist_ok=True)
@@ -496,7 +460,7 @@ def main():
         loss_function = DiceLoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
         )
     elif args.loss == "DiceCE":
         # Start with balanced weights for all classes
@@ -504,7 +468,7 @@ def main():
         loss_function = DiceCELoss(
             to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,
+            include_background=False,
             lambda_ce=0.5,
             lambda_dice=1.0,
             weight=class_weights
@@ -568,140 +532,10 @@ def main():
             "threshold", "include_background", "normalization_type"
         ])
     
-    # Create a file for logging agent changes
-    agent_changes_file = os.path.join(logs_dir, "agent_changes.log")
-    save_file(f"Agent changes log - {timestamp}\n" + "=" * 50 + "\n\n", agent_changes_file, cloud_results_dir + "/logs/agent_changes.log" if using_cloud_storage else None)
-    
     # Setup metrics logging
     metrics_logs_dir = os.path.join(logs_dir, "metrics_logs")
     os.makedirs(metrics_logs_dir, exist_ok=True)
-    metrics_logging = setup_agent_logging(metrics_logs_dir)
-    
-    # Import agents from HYPERA1/agents
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from agents.shared_state import SharedStateManager
-    from agents.agent_factory import AgentFactory
-    from agents.agent_coordinator import AgentCoordinator
-    
-    # Initialize shared state manager
-    shared_state_manager = SharedStateManager(
-        history_size=100,
-        log_dir=results_dir,
-        verbose=True,
-        total_epochs=args.epochs,
-        enable_enhanced_metrics=True
-    )
-    
-    # Initialize agent factory
-    agent_factory = AgentFactory(
-        shared_state_manager=shared_state_manager,
-        log_dir=results_dir,
-        device=device,
-        verbose=True
-    )
-    
-    # Create agents
-    learning_rate_agent = agent_factory.create_learning_rate_agent(
-        min_lr=1e-6,
-        max_lr=1e-2,
-        update_frequency=1,  
-        name="learning_rate_agent",
-        priority=5  # Highest priority
-    )
-    
-    weight_decay_agent = agent_factory.create_weight_decay_agent(
-        min_wd=1e-8,
-        max_wd=1e-3,
-        update_frequency=1,  
-        name="weight_decay_agent",
-        priority=4
-    )
-    
-    class_weights_agent = agent_factory.create_class_weights_agent(
-        num_classes=5,
-        min_weight=0.5,
-        max_weight=5.0,
-        update_frequency=1,  
-        name="class_weights_agent",
-        priority=3
-    )
-    
-    loss_function_agent = agent_factory.create_loss_function_agent(
-        min_lambda_ce=0.1,
-        max_lambda_ce=2.0,
-        min_lambda_dice=0.1,
-        max_lambda_dice=2.0,
-        update_frequency=1,  
-        name="loss_function_agent",
-        priority=2
-    )
-    
-    normalization_agent = agent_factory.create_normalization_agent(
-        update_frequency=1,  
-        name="normalization_agent",
-        priority=1  # Lowest priority
-    )
-    
-    # Set up agent logging
-    agent_logs_dir = os.path.join(logs_dir, "agent_logs")
-    agent_logging = setup_agent_logging(agent_logs_dir)
-    
-    # Define callback for agent changes
-    def log_agent_change(parameter_name, result):
-        agent_name = result.get("agent_name", "unknown")
-        old_value = result.get("old_value", "N/A")
-        new_value = result.get("new_value", "N/A")
-        change_magnitude = result.get("change_magnitude", 0.0)
-        current_epoch = 0 if 'epoch' not in globals() else epoch + 1
-        
-        # Log to file
-        with open(os.path.join(logs_dir, "agent_changes.txt"), "a") as f:
-            f.write(f"Epoch {current_epoch}: {agent_name} changed {parameter_name} from {old_value} to {new_value}\n")
-        
-        # Log to CSV
-        agent_logging['writers']['hyperparameters'].writerow([
-            current_epoch, agent_name, parameter_name, old_value, new_value, change_magnitude
-        ])
-        
-        # Print to console
-        print(f"Agent change: {agent_name} changed {parameter_name} from {old_value} to {new_value}")
-    
-    # Create agent coordinator with custom callback to log changes
-    agent_coordinator = AgentCoordinator(
-        shared_state_manager=shared_state_manager,
-        conflict_resolution_strategy=args.conflict_resolution,
-        update_frequency=args.agent_update_frequency,
-        log_dir=logs_dir,
-        verbose=True,
-        change_callback=log_agent_change
-    )
-    
-    # Register agents based on experiment type
-    if args.experiment_type == "agent_factory":
-        print("Running experiment with agent factory")
-        # Register all agents
-        agent_coordinator.register_agent(learning_rate_agent)
-        agent_coordinator.register_agent(weight_decay_agent)
-        agent_coordinator.register_agent(class_weights_agent)
-        agent_coordinator.register_agent(loss_function_agent)
-        agent_coordinator.register_agent(normalization_agent)
-    elif args.experiment_type == "no_agent":
-        print("Running experiment without agents")
-        # No agents will be registered, using fixed hyperparameters
-        pass
-    elif args.experiment_type == "grid_search":
-        print("Running experiment with grid search")
-        # TODO: Implement grid search logic
-        # For now, we'll just use the default hyperparameters
-        pass
-    else:
-        print(f"Unknown experiment type: {args.experiment_type}, using agent_factory")
-        # Register all agents as default
-        agent_coordinator.register_agent(learning_rate_agent)
-        agent_coordinator.register_agent(weight_decay_agent)
-        agent_coordinator.register_agent(class_weights_agent)
-        agent_coordinator.register_agent(loss_function_agent)
-        agent_coordinator.register_agent(normalization_agent)
+    metrics_logging = setup_metrics_logging(metrics_logs_dir)
     
     # Training loop
     best_metric = -1
@@ -810,223 +644,64 @@ def main():
         tb_writer.add_scalar("metrics/val_loss", val_loss, epoch + 1)
         tb_writer.add_scalar("metrics/train_loss", epoch_loss, epoch + 1)
         
-        # Update shared state with metrics
-        shared_state_manager.record_metrics(epoch + 1, {
-            "train_loss": epoch_loss,
-            "val_loss": val_loss,
-            "dice_score": metric,
-            "lr": optimizer.param_groups[0]["lr"],
-            "weight_decay": optimizer.param_groups[0]["weight_decay"] if "weight_decay" in optimizer.param_groups[0] else None,
-        })
-        
-        # Collect gradient statistics for analysis
-        if epoch > 0 and len(train_loader) > 0:
-            # Sample a batch for gradient analysis
-            sample_batch = next(iter(train_loader))
-            sample_images, sample_labels = sample_batch["image"].to(device), sample_batch["label"].to(device)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            sample_outputs = model(sample_images)
-            sample_loss = loss_function(sample_outputs, sample_labels)
-            
-            # Backward pass to get gradients
-            sample_loss.backward()
-            
-            # Calculate gradient statistics
-            grad_norm = 0.0
-            grad_max = 0.0
-            grad_mean = 0.0
-            grad_std = 0.0
-            grad_median = 0.0
-            param_count = 0
-            
-            # Collect all gradients for detailed statistics
-            all_grads = []
-            
-            # Calculate per-layer gradient statistics
-            layer_grad_stats = {}
-            
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    # Overall statistics
-                    grad_norm += torch.norm(param.grad).item()
-                    grad_max = max(grad_max, torch.max(torch.abs(param.grad)).item())
-                    grad_mean += torch.mean(torch.abs(param.grad)).item()
-                    param_count += 1
-                    
-                    # Collect gradients for detailed statistics
-                    flat_grad = param.grad.flatten().detach().cpu().numpy()
-                    all_grads.extend(flat_grad)
-                    
-                    # Per-layer statistics
-                    layer_name = name.split('.')[0]  # Get the top-level module name
-                    if layer_name not in layer_grad_stats:
-                        layer_grad_stats[layer_name] = {
-                            'norm': 0.0,
-                            'max': 0.0,
-                            'mean': 0.0,
-                            'count': 0
-                        }
-                    
-                    layer_grad_stats[layer_name]['norm'] += torch.norm(param.grad).item()
-                    layer_grad_stats[layer_name]['max'] = max(
-                        layer_grad_stats[layer_name]['max'], 
-                        torch.max(torch.abs(param.grad)).item()
-                    )
-                    layer_grad_stats[layer_name]['mean'] += torch.mean(torch.abs(param.grad)).item()
-                    layer_grad_stats[layer_name]['count'] += 1
-            
-            # Calculate final statistics
-            if param_count > 0:
-                grad_mean /= param_count
-                
-                # Calculate additional statistics if we have gradients
-                if all_grads:
-                    all_grads = np.array(all_grads)
-                    grad_std = np.std(all_grads)
-                    grad_median = np.median(np.abs(all_grads))
-                
-                # Finalize per-layer statistics
-                for layer_name in layer_grad_stats:
-                    if layer_grad_stats[layer_name]['count'] > 0:
-                        layer_grad_stats[layer_name]['mean'] /= layer_grad_stats[layer_name]['count']
-                
-                # Add gradient statistics to shared state for agents to use
-                shared_state_manager.record_metrics(epoch + 1, {
-                    "grad_norm": grad_norm,
-                    "grad_max": grad_max,
-                    "grad_mean": grad_mean,
-                    "grad_std": grad_std,
-                    "grad_median": grad_median,
-                    "grad_zero_fraction": np.mean(np.abs(all_grads) < 1e-8) if len(all_grads) > 0 else 0,
-                })
-                
-                # Add per-layer statistics to shared state
-                for layer_name, stats in layer_grad_stats.items():
-                    shared_state_manager.record_metrics(epoch + 1, {
-                        f"grad_{layer_name}_norm": stats['norm'],
-                        f"grad_{layer_name}_max": stats['max'],
-                        f"grad_{layer_name}_mean": stats['mean'],
-                    })
-                
-                # Log gradient statistics
-                tb_writer.add_scalar("gradients/norm", grad_norm, epoch + 1)
-                tb_writer.add_scalar("gradients/max", grad_max, epoch + 1)
-                tb_writer.add_scalar("gradients/mean", grad_mean, epoch + 1)
-                tb_writer.add_scalar("gradients/std", grad_std, epoch + 1)
-                tb_writer.add_scalar("gradients/median", grad_median, epoch + 1)
-                
-                # Log per-layer gradient statistics
-                for layer_name, stats in layer_grad_stats.items():
-                    tb_writer.add_scalar(f"gradients/{layer_name}/norm", stats['norm'], epoch + 1)
-                    tb_writer.add_scalar(f"gradients/{layer_name}/max", stats['max'], epoch + 1)
-                    tb_writer.add_scalar(f"gradients/{layer_name}/mean", stats['mean'], epoch + 1)
-                
-                # Log to CSV
-                metrics_logging['writers']['metrics'].writerow([
-                    epoch + 1,
-                    "gradient_statistics",
-                    f"norm: {grad_norm:.6f}, max: {grad_max:.6f}, mean: {grad_mean:.6f}, " +
-                    f"std: {grad_std:.6f}, median: {grad_median:.6f}"
-                ])
-        
-        # Get agent recommendations for hyperparameters
-        agent_updates = agent_coordinator.update(epoch + 1)
-        
-        # Apply agent updates to optimizer and loss function parameters
-        for param_name, result in agent_updates.items():
-            agent_name = result.get("agent_name", "unknown")
-            action = result.get("action", "unknown")
-            
-            # Log to CSV
-            agent_logging['writers']['agent_actions'].writerow([
-                epoch + 1, 
-                agent_name,
-                str(action),
-                "Yes"  # If it's in agent_updates, it was applied
-            ])
-        
-        # Analyze validation loss improvement for better agent feedback
-        if epoch > 0 and len(val_loss_values) >= 2:
-            val_loss_change = val_loss_values[-2] - val_loss_values[-1]
-            val_loss_improvement = val_loss_change / val_loss_values[-2] if val_loss_values[-2] > 0 else 0
-            
-            # Log validation improvement
-            tb_writer.add_scalar("metrics/val_loss_improvement", val_loss_improvement, epoch + 1)
-            
-            # Log to CSV
-            metrics_logging['writers']['metrics'].writerow([
-                epoch + 1,
-                "val_loss_improvement",
-                f"{val_loss_improvement:.6f}"
-            ])
-        
         # Log metrics to CSV
         lambda_ce = loss_function.lambda_ce if hasattr(loss_function, "lambda_ce") else None
         lambda_dice = loss_function.lambda_dice if hasattr(loss_function, "lambda_dice") else None
-        class_weights = loss_function.weight.tolist() if hasattr(loss_function, "weight") and loss_function.weight is not None else None
+        focal_gamma = loss_function.focal_gamma if hasattr(loss_function, "focal_gamma") else None
         
-        # Get current threshold from post_pred transform
-        current_threshold = 0.5
-        for transform in post_pred.transforms:
-            if isinstance(transform, AsDiscrete) and hasattr(transform, 'threshold'):
-                current_threshold = transform.threshold
-        
-        with open(csv_filename, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch + 1, 
-                epoch_loss, 
-                val_loss, 
-                metric,
-                optimizer.param_groups[0]["lr"],
-                lambda_ce,
-                lambda_dice,
-                class_weights,
-                current_threshold,
-                loss_function.include_background if hasattr(loss_function, "include_background") else True,
-                "instance_norm"  # Default normalization type
-            ])
-        
-        # Log metrics, agent states, and rewards to CSV files
-        agent_logging['writers']['metrics'].writerow([
-            epoch + 1, epoch_loss, metric, val_loss, metric
+        # Log current hyperparameters
+        metrics_logging['writers']['hyperparameters'].writerow([
+            epoch + 1, 
+            "learning_rate", 
+            optimizer.param_groups[0]["lr"]
         ])
         
-        # Log agent states and rewards
-        for agent_name, agent in agent_coordinator.agents.items():
-            if isinstance(agent_name, str):
-                # Skip if it's just a string
-                continue
-            try:
-                agent_state = agent.get_state_representation()
-                state_str = ','.join([str(x) for x in agent_state])
-                agent_logging['writers']['agent_states'].writerow([
-                    epoch + 1, agent_name.name, state_str
-                ])
-            except Exception as e:
-                print(f"Error getting state for agent: {e}")
-            
-            # Log rewards if available
-            if hasattr(agent, 'last_reward'):
-                reward_components = {}
-                if hasattr(agent, 'last_reward_components'):
-                    reward_components = agent.last_reward_components
-                
-                stability = reward_components.get('stability', 0.0)
-                generalization = reward_components.get('generalization', 0.0)
-                efficiency = reward_components.get('efficiency', 0.0)
-                
-                agent_logging['writers']['agent_rewards'].writerow([
-                    epoch + 1, agent_name.name, agent.last_reward, stability, generalization, efficiency
-                ])
+        if "weight_decay" in optimizer.param_groups[0]:
+            metrics_logging['writers']['hyperparameters'].writerow([
+                epoch + 1, 
+                "weight_decay", 
+                optimizer.param_groups[0]["weight_decay"]
+            ])
+        
+        # Log loss function parameters if available
+        if lambda_ce is not None:
+            metrics_logging['writers']['hyperparameters'].writerow([
+                epoch + 1, 
+                "lambda_ce", 
+                lambda_ce
+            ])
+        
+        if lambda_dice is not None:
+            metrics_logging['writers']['hyperparameters'].writerow([
+                epoch + 1, 
+                "lambda_dice", 
+                lambda_dice
+            ])
+        
+        if focal_gamma is not None:
+            metrics_logging['writers']['hyperparameters'].writerow([
+                epoch + 1, 
+                "focal_gamma", 
+                focal_gamma
+            ])
+        
+        # Log normalization type
+        metrics_logging['writers']['hyperparameters'].writerow([
+            epoch + 1, 
+            "normalization_type", 
+            "instance_norm"  # Default normalization type
+        ])
+        
+        # Log metrics to CSV
+        metrics_logging['writers']['metrics'].writerow([
+            epoch + 1, epoch_loss, metric, val_loss, metric
+        ])
         
         # Print metrics
         print(f"Epoch {epoch + 1}/{args.epochs}, "
               f"Train Loss: {epoch_loss:.4f}, "
               f"Val Loss: {val_loss:.4f}, "
-              f"Dice Score: {metric:.4f}, "
+              f"Val Dice: {metric:.4f}, "
               f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Save checkpoint if best model
@@ -1102,19 +777,19 @@ def main():
         print(f"Results also saved to {cloud_results_dir}")
     
     # Close all log files
-    for file_handle in agent_logging['files'].values():
+    for file_handle in metrics_logging['files'].values():
         file_handle.close()
     
-    print(f"Agent logs saved to {agent_logs_dir}")
+    print(f"Metrics logs saved to {metrics_logs_dir}")
     
     # Copy logs to cloud storage if needed
     if using_cloud_storage:
-        cloud_agent_logs_dir = os.path.join(cloud_results_dir, "agent_logs")
-        for log_file in os.listdir(agent_logs_dir):
-            local_path = os.path.join(agent_logs_dir, log_file)
-            cloud_path = os.path.join(cloud_agent_logs_dir, log_file)
+        cloud_metrics_logs_dir = os.path.join(cloud_results_dir, "metrics_logs")
+        for log_file in os.listdir(metrics_logs_dir):
+            local_path = os.path.join(metrics_logs_dir, log_file)
+            cloud_path = os.path.join(cloud_metrics_logs_dir, log_file)
             copy_to_gcs(local_path, cloud_path)
-        print(f"Agent logs copied to {cloud_agent_logs_dir}")
+        print(f"Metrics logs copied to {cloud_metrics_logs_dir}")
     
     # Print final results
     print(f"\nTraining completed. Best Dice score: {best_metric:.4f} at epoch {best_metric_epoch}")
@@ -1123,32 +798,27 @@ def main():
     final_hyperparameters = {
         "optimizer": args.optimizer,
         "learning_rate": optimizer.param_groups[0]["lr"],
-        "weight_decay": optimizer.param_groups[0]["weight_decay"] if "weight_decay" in optimizer.param_groups[0] else args.weight_decay,
-        "loss": args.loss,
-        "augmentations": args.augmentations,
+        "weight_decay": optimizer.param_groups[0]["weight_decay"] if "weight_decay" in optimizer.param_groups[0] else None,
+        "loss_function": args.loss,
+        "lambda_ce": loss_function.lambda_ce if hasattr(loss_function, "lambda_ce") else None,
+        "lambda_dice": loss_function.lambda_dice if hasattr(loss_function, "lambda_dice") else None,
+        "focal_gamma": loss_function.focal_gamma if hasattr(loss_function, "focal_gamma") else None,
+        "include_background": loss_function.include_background if hasattr(loss_function, "include_background") else True,
         "dropout": args.dropout,
-        "batch_size": args.batch_size,
-        "patch_size": args.patch_size,
-        "best_metric": float(best_metric),
+        "augmentations": args.augmentations,
+        "best_metric": best_metric,
         "best_metric_epoch": best_metric_epoch,
         "total_epochs": epoch + 1
     }
     
-    # If using agent_factory, add agent-specific hyperparameters
-    if args.experiment_type == "agent_factory":
-        for agent_name, agent in agent_coordinator.agents.items():
-            if isinstance(agent_name, str):
-                # Skip if it's just a string
-                continue
-            agent_state = agent.get_current_state()
-            final_hyperparameters[f"agent_{agent_name.name}"] = agent_state
-    
     # Save final hyperparameters to JSON
     final_hyperparams_file = os.path.join(logs_dir, "final_hyperparameters.json")
     save_file(final_hyperparameters, final_hyperparams_file, 
-             os.path.join(cloud_results_dir, "logs", "final_hyperparameters.json") if using_cloud_storage else None)
+              cloud_results_dir + "/logs/final_hyperparameters.json" if using_cloud_storage else None)
     
     print(f"Final hyperparameters saved to {final_hyperparams_file}")
+    if using_cloud_storage:
+        print(f"Final hyperparameters also saved to {cloud_results_dir}/logs/final_hyperparameters.json")
     
     # If using cloud storage, copy all remaining files
     if using_cloud_storage:

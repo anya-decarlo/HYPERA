@@ -274,9 +274,9 @@ def main():
     if args.loss == "Dice":
         # Start with basic parameters
         loss_function = DiceLoss(
-            to_onehot_y=True,
+            to_onehot_y=False,  # Labels are already one-hot encoded
             softmax=True,
-            include_background=True,  # Start with including background (may not be optimal)
+            include_background=False,  # Start with including background (may not be optimal)
         )
     elif args.loss == "DiceCE":
         # Start with unbalanced parameters
@@ -284,7 +284,7 @@ def main():
         loss_function = DiceCELoss(
             to_onehot_y=True,
             softmax=True,
-            include_background=True,  # Start with including background
+            include_background=False,  # Start with including background (may not be optimal)
             lambda_ce=0.5,  # Start with CE weighted less
             lambda_dice=1.5,  # Start with Dice weighted more
             weight=class_weights,
@@ -331,7 +331,7 @@ def main():
         initial_lambda_dice=1.5 if args.loss == "DiceCE" else None,  # Start unbalanced
         initial_class_weights=[1.0, 1.0, 1.0, 1.0, 1.0],  # Equal class weights
         initial_threshold=0.5,  # Standard threshold
-        initial_include_background=True,  # Start by including background
+        initial_include_background=False,  # Start by including background
         initial_normalization_type='instance_norm',  # Start with instance norm
         patience=1,  # Shorter patience to allow more frequent adjustments
         cooldown=args.agent_cooldown,
